@@ -1,3 +1,5 @@
+# how to use: https://tomlankhorst.nl/brew-bundle-restore-backup/
+
 tap "homebrew/bundle"
 tap "homebrew/cask"
 tap "homebrew/cask-drivers"
