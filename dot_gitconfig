@@ -1,0 +1,29 @@
+[alias]
+  l = log --pretty=colored
+  sl = log --oneline --decorate -20
+  sla = log --oneline --decorate --graph --all -20
+  slap = log --oneline --decorate --graph --all
+[core]
+  pager = diff-so-fancy | less --tabs=1,5 -R
+[color "diff"]
+  meta = "yellow bold"
+  commit = "green bold"
+  frag = "magenta bold"
+  old = "red bold"
+  new = "green bold"
+  whitespace = "red reverse"
+[color "diff-highlight"]
+  oldNormal = "red bold"
+  oldHighlight = "red bold 52"
+  newNormal = "green bold"
+  newHighlight = "green bold 22"
+[pretty]
+  colored = format:%Cred%h%Creset %s %Cgreen(%cr) %C(bold blue)%an%Creset
+[user]
+  name = Mike Borsare
+  email = mborsare@gmail.com
+[filter "lfs"]
+ required = true
+ clean = git-lfs clean -- %f
+ smudge = git-lfs smudge -- %f
+ process = git-lfs filter-process
