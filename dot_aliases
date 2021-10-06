@@ -18,4 +18,4 @@ alias h="~/"
 alias hs="hub sync"
 alias nuke="rm -rf"
 alias s="subl"
-alias unfuck="git reset --hard origin/master"bang
+alias unfuck="git reset --hard origin/master"
