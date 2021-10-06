@@ -44,3 +44,6 @@ if ! zplug check --verbose; then
 fi
 
 zplug load
+
+# Load aliases
+source $HOME/.aliases
