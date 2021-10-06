@@ -1,0 +1,76 @@
+" theme stuff
+" colorscheme hybrid_material
+set background=dark
+
+" map the keys 'jk' to the Escape key to improve efficiency.
+inoremap jk <Esc>`^
+
+" change cursor for different modes
+let &t_EI.="\e[1 q"
+let &t_SI.="\e[5 q"
+let &t_SR.="\e[3 q"
+let &t_ti.="\e[1 q"
+let &t_te.="\e[0 q"
+
+" relative line numbers
+set number
+set relativenumber
+augroup linenumbers
+  autocmd!
+  autocmd BufEnter *    :set relativenumber
+  autocmd BufLeave *    :set number norelativenumber
+  autocmd WinEnter *    :set relativenumber
+  autocmd WinLeave *    :set number norelativenumber
+  autocmd InsertEnter * :set number norelativenumber
+  autocmd InsertLeave * :set relativenumber
+  autocmd FocusLost *   :set number norelativenumber
+  autocmd FocusGained * :set relativenumber
+augroup END
+
+" Map ; to : for faster commands
+nmap ; :
+noremap ;; ;
+
+" Leader shortcuts
+noremap <leader>q :q<cr> " Quit files with leader q
+noremap <leader>w :w<cr> " Save files with leader w
+noremap <leader>x :x<cr> " Save and close
+noremap <leader>bd :bd<cr> " Kill buffer
+noremap <leader>bdd :bd!<cr> " Force kill buffer
+noremap <leader>ev :vsp $HOME/dotfiles-local/vimrc.local<cr> " edit vimrc
+noremap <leader>ez :vsp $HOME/dotfiles-local/zshrc.local<cr> " edit zshrc
+noremap <leader>sv :source $MYVIMRC<cr> " reload vimrc
+noremap <leader>tr :RainbowToggle<cr> " toggle rainbow parens
+
+" Remove trailing blank lines on save
+" and preserve cursor position
+function! TrimEndLines()
+  let save_cursor = getpos(".")
+  :silent! %s#\($\n\s*\)\+\%$##
+  call setpos('.', save_cursor)
+endfunction
+
+autocmd BufWritePre * call TrimEndLines()
+
+" Plugin settings
+" source $HOME/dotfiles-local/vim/lightline-buffer.vim
+" source $HOME/dotfiles-local/vim/prettier.vim
+" source $HOME/dotfiles-local/vim/indent-guides.vim
+" source $HOME/dotfiles-local/vim/vim-highlightedyank.vim
+let g:ctrlp_map = '<Leader>p'
+let g:colorizer_auto_filetype = 'css,html,less,scss'
+let g:rainbow_active = 0 " Rainbow parens off by default
+
+" Less wonky mouse scrolling in terminal
+set mouse=a
+
+" Set a comfortable line-height
+set linespace=2
+
+" Disable audible and visual bells
+set noerrorbells
+set novisualbell
+set t_vb=
+
+" highlight current column
+set cursorcolumn 
