@@ -31,6 +31,23 @@ printf "\n"
   printf "\n      %s\n" "Biometric scan passed"
 weather_raw="$(curl -fsSL --max-time 2 'wttr.in/?format=%C+%t+%w' 2>/dev/null || true)"
 printf "\n      %s @ \033[38;5;245m%s\033[0m" "${weather_raw:-Weather unavailable}" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+printf "\n\n      %s\n" "Recent local additions"
+
+for dir in "$HOME/bin" "$HOME/.local/bin" "$HOME/scripts" "$HOME/Sites/mikeb.work"; do
+  [[ -d "$dir" ]] || continue
+
+  recent="$(find "$dir" -maxdepth 1 -type f -mtime -14 -print 2>/dev/null \
+    | sed "s#$HOME#~#" \
+    | sort \
+    | tail -5)"
+
+  [[ -n "$recent" ]] || continue
+
+  printf "\n      \033[38;5;245m%s\033[0m\n" "${dir/#$HOME/~}"
+  printf "%s\n" "$recent" | sed 's/^/        /'
+done
+
 printf "\n\n\n"
 fi
 
@@ -51,6 +68,8 @@ alias delete='rm -rv'
 alias docs='cd "$HOME/Documents"'
 alias dot='git --git-dir=$HOME/.dotfiles --work-tree=$HOME'
 alias edit='nvim'
+alias mp3='$HOME/.local/bin/mp3'
+alias ip='ipconfig getifaddr en0'
 alias nv='nvim'
 alias ga='git add'
 alias gc='git commit'
@@ -62,6 +81,7 @@ alias h='cd ~'
 alias http='python3 -m http.server'
 alias ls='ls -G'
 alias mb='cd "$HOME/Sites/mikeb.work/"'
+alias nuke="rm -rf"
 alias nv='${EDITOR:-nvim}'
 alias pip='python3 -m pip'
 alias rc='${EDITOR:-nvim} ~/.zshrc'
