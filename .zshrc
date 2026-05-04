@@ -63,6 +63,7 @@ export AERC_CONFIG="$HOME/Library/Preferences/aerc"
 [[ -s "$NVM_DIR/bash_completion" ]] && . "$NVM_DIR/bash_completion"
 
 alias at="$HOME/at.sh"
+alias br='brew'
 alias day="$HOME/day.sh"
 alias delete='rm -rv'
 alias docs='cd "$HOME/Documents"'
@@ -116,7 +117,7 @@ up() {
   local input="$1"
   local minutes="${2:-}"
   local chunk_seconds="${3:-60}"
-  local stall_limit=60
+  local warmup_limit=180
   local model="realesr-animevideov3-x4"
   local cache_root="$HOME/.cache/up"
 
@@ -138,6 +139,13 @@ up() {
   mkdir -p "$chunks_dir" "$parts_dir" "$work_dir"
   touch "$log_file"
 
+  local max_gb="${UP_MAX_SCRATCH_GB:-10}"
+  _check_space() {
+    local used
+    used="$(du -sm "$run_dir" 2>/dev/null | awk '{print $1}')"
+    (( used > max_gb * 1024 ))
+  }
+
   _log() {
     printf '%s  %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$log_file"
   }
@@ -154,7 +162,7 @@ up() {
   local deadline=0
   [[ -n "$minutes" ]] && deadline=$(( $(date +%s) + minutes * 60 ))
 
-  # Split source into local chunks.
+  # Split source into chunks (skipped on resume).
   if [[ -z "$(find "$chunks_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
     _log "→ splitting into ${chunk_seconds}s chunks..."
     ffmpeg -loglevel error -y -i "$abs_input" \
@@ -181,6 +189,12 @@ up() {
     if [[ "$deadline" -gt 0 && "$(date +%s)" -ge "$deadline" ]]; then
       _log "→ time limit reached before chunk $(basename "$chunk")"
       break
+    fi
+
+    if _check_space; then
+      _log "✗ scratch limit ${max_gb}GB reached — stopping before $(basename "$chunk")"
+      kill "$caf_pid" 2>/dev/null
+      return 1
     fi
 
     _cleanup_chunk_dirs
@@ -224,8 +238,8 @@ up() {
       -j 4:4:4 &
     local up_pid=$!
 
-    local last_c=0
-    local stall_p=0
+    local warmup_done=0
+    local warmup_p=0
 
     while kill -0 "$up_pid" 2>/dev/null; do
       sleep 5
@@ -234,19 +248,17 @@ up() {
       cur="$(find "$upscaled_dir" -name "*_${model}.png" | wc -l | tr -d ' ')"
       printf "\r\033[K  upscaling chunk %03d: %d/%d" "$part_idx" "$cur" "$total"
 
-      if [[ "$cur" -eq "$last_c" ]]; then
-        ((stall_p++))
-      else
-        stall_p=0
+      if [[ "$cur" -gt 0 ]]; then
+        warmup_done=1
       fi
-      last_c="$cur"
 
-      if [[ "$stall_p" -ge "$stall_limit" ]]; then
-        kill "$up_pid"
-        printf "\n"
-        _log "✗ stalled on $(basename "$chunk")"
-        kill "$caf_pid" 2>/dev/null
-        return 1
+      if [[ "$warmup_done" -eq 0 ]]; then
+        (( warmup_p++ ))
+        if [[ "$warmup_p" -ge "$warmup_limit" ]]; then
+          kill "$up_pid"; printf "\n"
+          _log "✗ warmup timeout on $(basename "$chunk")"
+          kill "$caf_pid" 2>/dev/null; return 1
+        fi
       fi
 
       if [[ "$deadline" -gt 0 && "$(date +%s)" -ge "$deadline" ]]; then
@@ -292,10 +304,13 @@ up() {
 
     _log "✓ part done: $(basename "$part_file")"
 
+    rm -f "$chunk"
+    _log "✓ chunk removed: $(basename "$chunk")"
+
     # Free local disk before next chunk.
     rm -rf "$frames_dir" "$upscaled_dir" "$concat_file"
 
-    ((part_idx++))
+    (( part_idx++ ))
   done
 
   if [[ -z "$(find "$parts_dir" -name 'part_*.mp4' -print -quit 2>/dev/null)" ]]; then
@@ -319,3 +334,4 @@ up() {
   _log "✓ done: ${abs_input%.*}_up.mp4"
   kill "$caf_pid" 2>/dev/null
 }
+
