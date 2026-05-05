@@ -1,6 +1,26 @@
+# ── Locale & Environment ────────────────────────────────────────────────────
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export COPYFILE_DISABLE=1
+export EDITOR='nvim'
+export VISUAL='nvim'
+export HOMEBREW_NO_ENV_HINTS=1
+export PATH="/usr/local/opt/openjdk@17/bin:/usr/local/opt/openjdk/bin:$HOME/.local/bin:/usr/local/sbin:$PATH"
+export NVM_DIR="$HOME/.nvm"
+export AERC_CONFIG="$HOME/Library/Preferences/aerc"
+
 # ── Login banner ────────────────────────────────────────────────────────────
 if [[ -o interactive ]]; then
   clear
+
+  # 1. Curated "Safe" Palette (Global variable so PROMPT can use it)
+  # Excludes vibrating reds and deep blues for better legibility on black
+  prime_colors=(39 45 51 81 87 118 121 159 214 208 141)
+  RANDOM_COL=$prime_colors[$(( 1 + RANDOM % $#prime_colors ))]
+  
+  # Start the random theme color
+  printf "\033[38;5;${RANDOM_COL}m"
+
   cat <<'EOF'
 
       ██▓███   ██▀███   ██▓ ███▄ ▄███▓▓█████ 
@@ -17,48 +37,57 @@ if [[ -o interactive ]]; then
 
 
 EOF
-loader_width=45
-for pct in 0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100; do
-  filled=$(( pct * loader_width / 100 ))
-  empty=$(( loader_width - filled ))
-  bar="$(printf '%*s' "$filled" '' | tr ' ' '#')"
-  gap="$(printf '%*s' "$empty" '' | tr ' ' '.')"
-  printf "\r\033[K      [%s%s] %3d%%" "$bar" "$gap" "$pct"
-  sleep 0.025
-done
-printf "\n"
-  printf "\n      %s\n" ".╩╬╦.."
-  printf "\n      %s\n" "Biometric scan passed"
-weather_raw="$(curl -fsSL --max-time 2 'wttr.in/?format=%C+%t+%w' 2>/dev/null || true)"
-printf "\n      %s @ \033[38;5;245m%s\033[0m" "${weather_raw:-Weather unavailable}" "$(date '+%Y-%m-%d %H:%M:%S')"
 
-printf "\n\n      %s\n" "Recent local additions"
+  # Progress Bar matching Screenshot 2026-05-05 at 00.38.15.png
+  loader_width=45
+  for pct in 0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100; do
+    filled=$(( pct * loader_width / 100 ))
+    empty=$(( loader_width - filled ))
+    bar="$(printf '\033[38;5;%sm%*s\033[0m' "$RANDOM_COL" "$filled" '' | tr ' ' '#')"
+    gap="$(printf '%*s' "$empty" '' | tr ' ' '.')"
+    printf "\r\033[K      [%s%s] %3d%%" "$bar" "$gap" "$pct"
+    sleep 0.02
+  done
 
-for dir in "$HOME/bin" "$HOME/.local/bin" "$HOME/scripts" "$HOME/Sites/mikeb.work"; do
-  [[ -d "$dir" ]] || continue
+  printf "\n\n"
 
-  recent="$(find "$dir" -maxdepth 1 -type f -mtime -14 -print 2>/dev/null \
-    | sed "s#$HOME#~#" \
-    | sort \
-    | tail -5)"
+  # --- SUCCESS LOCK-IN ENGINE (Yellow 226) ---
+  # Replaces "error" style jostle with a smooth slide and blink
+  local bio_msg="Access granted. Have a nice day"
+  local yellow="\033[38;5;226m"
+  local reset="\033[0m"
 
-  [[ -n "$recent" ]] || continue
+  for i in {0..6}; do
+    local indent=$(printf '%*s' "$i" '')
+    printf "\r\033[K%s%b%s%b" "$indent" "$yellow" "$bio_msg" "$reset"
+    sleep 0.015
+  done
+  
+  sleep 0.1
+  printf "\r\033[K      %b%s%b" "$reset" "$bio_msg" "$reset" 
+  sleep 0.1
+  printf "\r\033[K      %b%s%b\n" "$yellow" "$bio_msg" "$reset" 
+  # ------------------------------------------
 
-  printf "\n      \033[38;5;245m%s\033[0m\n" "${dir/#$HOME/~}"
-  printf "%s\n" "$recent" | sed 's/^/        /'
-done
+  weather_raw="$(curl -fsSL --max-time 2 'wttr.in/?format=%C+%t+%w' 2>/dev/null || true)"
+  printf "\n      \033[38;5;${RANDOM_COL}m%s\033[0m @ \033[38;5;245m%s\033[0m" "${weather_raw:-Weather unavailable}" "$(date '+%Y-%m-%d %H:%M:%S')"
 
-printf "\n\n\n"
+  printf "\n\n      \033[38;5;${RANDOM_COL}m%s\033[0m\n" "Recent local additions"
+
+  for dir in "$HOME/bin" "$HOME/.local/bin" "$HOME/scripts" "$HOME/Sites/mikeb.work"; do
+    [[ -d "$dir" ]] || continue
+    recent="$(find "$dir" -maxdepth 1 -type f -mtime -14 -print 2>/dev/null | sed "s#$HOME#~#" | sort | tail -5)"
+    [[ -n "$recent" ]] || continue
+
+    printf "\n      \033[38;5;${RANDOM_COL}m%s\033[0m\n" "${dir/#$HOME/~}"
+    printf "%s\n" "$recent" | sed 's/^/        /'
+  done
+
+  printf "\n\n\n"
+  printf "\033[0m"
 fi
 
-export COPYFILE_DISABLE=1
-export EDITOR='nvim'
-export VISUAL='nvim'
-export HOMEBREW_NO_ENV_HINTS=1
-export PATH="/usr/local/opt/openjdk@17/bin:/usr/local/opt/openjdk/bin:$HOME/.local/bin:/usr/local/sbin:$PATH"
-export NVM_DIR="$HOME/.nvm"
-export AERC_CONFIG="$HOME/Library/Preferences/aerc"
-
+# ── Aliases ──────────────────────────────────────────────────────────────────
 [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh"
 [[ -s "$NVM_DIR/bash_completion" ]] && . "$NVM_DIR/bash_completion"
 
@@ -80,12 +109,11 @@ alias gs='git status'
 alias h='cd ~'
 alias http='python3 -m http.server'
 alias ip='ipconfig getifaddr en0'
-alias jump='popd'           # The "Jump" button
-alias jumps='dirs -v'        # See your recent jump points with numbers
+alias jump='popd'
+alias jumps='dirs -v'
 alias ls='ls -G'
 alias mb='cd "$HOME/Sites/mikeb.work/"'
 alias nuke="rm -rf"
-alias nv='${EDITOR:-nvim}'
 alias nv='nvim'
 alias pip='python3 -m pip'
 alias re='source ~/.zshrc'
@@ -94,12 +122,12 @@ alias scrap='${EDITOR:-nvim} -c "setlocal buftype=nofile bufhidden=wipe noswapfi
 alias stream='$HOME/stream.sh'
 
 unalias venv 2>/dev/null
-
 venv() {
   [[ -d venv ]] || python3 -m venv venv
   source venv/bin/activate
 }
 
+# ── Zsh Settings & Prompt ────────────────────────────────────────────────────
 zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
 zstyle ':completion:*' menu select
 export CLICOLOR=1
@@ -109,11 +137,13 @@ setopt AUTO_CD
 setopt AUTO_PUSHD 
 setopt PROMPT_SUBST
 setopt PUSHD_IGNORE_DUPS
-# PROMPT='%F{81}%n@%m%f %F{189}%~%f %F{226}%%%f '
-PROMPT=$'\n%F{81}%n@%m %F{189}%3~ %F{226}[%*] %F{118}$(pmset -g batt | grep -Eo "\d+%" | cut -d% -f1)%f
+
+# Unified identity color matching the banner (RANDOM_COL)
+# Grey timestamp [242] and Green battery [118]
+PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~ %F{242}[%*]%f %F{118}$(pmset -g batt | grep -Eo "\d+%" | cut -d% -f1)%f
 %F{226}%%%f '
 
-
+# ── Tmux Auto-Attach ─────────────────────────────────────────────────────────
 if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
   if tmux has-session -t main 2>/dev/null; then
     exec tmux attach -t main
@@ -121,4 +151,3 @@ if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
     exec tmux new-session -s main -n Zsh
   fi
 fi
-
