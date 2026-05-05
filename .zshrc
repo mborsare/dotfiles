@@ -109,7 +109,10 @@ setopt AUTO_CD
 setopt AUTO_PUSHD 
 setopt PROMPT_SUBST
 setopt PUSHD_IGNORE_DUPS
-PROMPT='%F{81}%n@%m%f %F{189}%~%f %F{226}%%%f '
+# PROMPT='%F{81}%n@%m%f %F{189}%~%f %F{226}%%%f '
+PROMPT=$'\n%F{81}%n@%m %F{189}%3~ %F{226}[%*] %F{118}$(pmset -g batt | grep -Eo "\d+%" | cut -d% -f1)%f
+%F{226}%%%f '
+
 
 if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
   if tmux has-session -t main 2>/dev/null; then
