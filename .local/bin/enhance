@@ -1,0 +1,148 @@
+#!/usr/bin/env zsh
+
+# --- Configuration ---
+input="$1"
+minutes="${2:-}"
+chunk_seconds="${3:-60}"
+warmup_limit=180
+model="realesr-animevideov3-x4"
+cache_root="$HOME/.cache/up"
+max_gb="${UP_MAX_SCRATCH_GB:-10}"
+
+# --- Validation ---
+[[ -z "$input" ]] && { echo "✗ usage: enhance <file> [minutes] [chunk_seconds]"; exit 1; }
+[[ ! -f "$input" ]] && { echo "✗ not found: $input"; exit 1; }
+
+abs_input="$(realpath "$input")"
+base_name="$(basename "$abs_input" | sed 's/\.[^.]*$//')"
+
+run_dir="$cache_root/$base_name"
+chunks_dir="$run_dir/chunks"
+parts_dir="$run_dir/parts"
+work_dir="$run_dir/work"
+log_file="$run_dir/run.log"
+
+mkdir -p "$chunks_dir" "$parts_dir" "$work_dir"
+touch "$log_file"
+
+# --- Setup Helpers ---
+_log() { printf '%s  %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$log_file"; }
+
+_check_space() {
+  used="$(du -sm "$run_dir" 2>/dev/null | awk '{print $1}')"
+  (( used > max_gb * 1024 ))
+}
+
+_cleanup_chunk_dirs() {
+  rm -rf "$work_dir/frames" "$work_dir/upscaled"
+  mkdir -p "$work_dir/frames" "$work_dir/upscaled"
+}
+
+# --- Background Management ---
+caffeinate -dimsu -w $$ &
+caf_pid=$!
+# Kill caffeinate if script is interrupted or finishes
+trap "kill $caf_pid 2>/dev/null; exit" INT TERM EXIT
+
+_log "▶ starting: $base_name (PID: $$)"
+
+# --- Logic ---
+deadline=0
+[[ -n "$minutes" ]] && deadline=$(( $(date +%s) + minutes * 60 ))
+
+# 1. Splitting
+if [[ -z "$(find "$chunks_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  _log "→ splitting into ${chunk_seconds}s chunks..."
+  ffmpeg -loglevel error -y -i "$abs_input" \
+    -c copy -map 0 \
+    -f segment -segment_time "$chunk_seconds" -reset_timestamps 1 \
+    "$chunks_dir/chunk_%03d.mkv" || { _log "✗ split failed"; exit 1; }
+fi
+
+fps="$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "$abs_input")"
+[[ -z "$fps" || "$fps" == "0/0" ]] && fps="24000/1001"
+
+part_idx=0
+for chunk in "$chunks_dir"/chunk_*.*; do
+  [[ -e "$chunk" ]] || continue
+  
+  if [[ "$deadline" -gt 0 && "$(date +%s)" -ge "$deadline" ]]; then
+    _log "→ time limit reached."
+    break
+  fi
+
+  if _check_space; then
+    _log "✗ scratch limit ${max_gb}GB reached."
+    exit 1
+  fi
+
+  _cleanup_chunk_dirs
+  frames_dir="$work_dir/frames"
+  upscaled_dir="$work_dir/upscaled"
+  part_file="$(printf '%s/part_%03d.mp4' "$parts_dir" "$part_idx")"
+
+  _log "→ processing $(basename "$chunk")"
+
+  # 2. Extract Frames
+  ffmpeg -loglevel error -y -i "$chunk" \
+    -vf "hqdn3d=1.2:1.2:4:4,unsharp=3:3:0.6:3:3:0.0" \
+    -q:v 2 "$frames_dir/frame_%05d.jpg" || { _log "✗ extract failed"; exit 1; }
+
+  total="$(find "$frames_dir" -name 'frame_*.jpg' | wc -l | tr -d ' ')"
+  [[ "$total" -eq 0 ]] && { _log "✗ no frames extracted"; exit 1; }
+
+  # 3. Upscale
+  /Applications/Upscayl.app/Contents/Resources/bin/upscayl-bin \
+    -i "$frames_dir" -o "$upscaled_dir" -s 2 -n "$model" \
+    -m "/Applications/Upscayl.app/Contents/Resources/models" -j 4:4:4 >/dev/null 2>&1 &
+  up_pid=$!
+
+  warmup_count=0
+  while kill -0 "$up_pid" 2>/dev/null; do
+    sleep 5
+    cur="$(find "$upscaled_dir" -maxdepth 1 -name "*.png" | wc -l | tr -d ' ')"
+    printf "\r\033[K   upscaling chunk %03d: %d/%d" "$part_idx" "$cur" "$total"
+
+    if [[ "$cur" -eq 0 ]]; then
+      (( warmup_count++ ))
+      if [[ "$warmup_count" -ge "$warmup_limit" ]]; then
+        kill -9 "$up_pid" 2>/dev/null
+        _log "✗ warmup timeout"
+        exit 1
+      fi
+    fi
+  done
+  printf "\n"
+
+  # 4. Cleanup & Assemble Part
+  find "$upscaled_dir" -name "frame_*.png" | while read -r f; do
+    clean_name=$(echo "$f" | sed -E 's/frame_([0-9]+).*\.png/frame_\1.png/')
+    [[ "$f" != "$clean_name" ]] && mv "$f" "$clean_name"
+  done
+
+  concat_file="$work_dir/concat.txt"
+  printf "file '%s'\n" "$upscaled_dir"/frame_*.png | sort -V > "$concat_file"
+
+  ffmpeg -loglevel error -y -f concat -safe 0 -r "$fps" -i "$concat_file" \
+    -i "$chunk" -map 0:v -map "1:a?" \
+    -vf "eq=contrast=1.05:saturation=1.1,unsharp=3:3:0.5" \
+    -c:v libx264 -pix_fmt yuv420p -crf 18 -preset fast -c:a copy \
+    "$part_file" || { _log "✗ assembly failed"; exit 1; }
+
+  _log "✓ part done: $(basename "$part_file")"
+  rm -f "$chunk"
+  (( part_idx++ ))
+done
+
+# 5. Final Concat
+_log "→ concatenating final output"
+final_concat="$run_dir/final_concat.txt"
+printf "file '%s'\n" "$parts_dir"/part_*.mp4 | sort -V > "$final_concat"
+
+ffmpeg -loglevel error -y -f concat -safe 0 -i "$final_concat" \
+  -c copy "${abs_input%.*}_up.mp4" && _log "✓ done: ${abs_input%.*}_up.mp4"
+
+# Cleanup trap so we can exit cleanly
+trap - INT TERM EXIT
+kill "$caf_pid" 2>/dev/null
+exit 0
