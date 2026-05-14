@@ -35,10 +35,8 @@ if [[ -o interactive ]]; then
 
       Cyber, art, and risk
 
-
 EOF
-
-  # Progress Bar matching Screenshot 2026-05-05 at 00.38.15.png
+  # Progress Bar
   loader_width=45
   for pct in 0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100; do
     filled=$(( pct * loader_width / 100 ))
@@ -51,8 +49,6 @@ EOF
 
   printf "\n\n"
 
-  # --- SUCCESS LOCK-IN ENGINE (Yellow 226) ---
-  # Replaces "error" style jostle with a smooth slide and blink
   local bio_msg="Access granted. Have a nice day"
   local yellow="\033[38;5;226m"
   local reset="\033[0m"
@@ -71,10 +67,9 @@ EOF
 
   weather_raw="$(curl -fsSL --max-time 2 'wttr.in/?format=%C+%t+%w' 2>/dev/null || true)"
   printf "\n      \033[38;5;${RANDOM_COL}m%s\033[0m @ \033[38;5;245m%s\033[0m" "${weather_raw:-Weather unavailable}" "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf "\n\n      \033[38;5;${RANDOM_COL}m%s\033[0m\n" "Hot files"
 
-  printf "\n\n      \033[38;5;${RANDOM_COL}m%s\033[0m\n" "Recent local additions"
-
-  for dir in "$HOME/bin" "$HOME/.local/bin" "$HOME/scripts" "$HOME/Sites/mikeb.work"; do
+  for dir in "$HOME" "$HOME/bin" "$HOME/.local/bin" "$HOME/scripts" "$HOME/Sites/mikeb.work"; do
     [[ -d "$dir" ]] || continue
     recent="$(find "$dir" -maxdepth 1 -type f -mtime -14 -print 2>/dev/null | sed "s#$HOME#~#" | sort | tail -5)"
     [[ -n "$recent" ]] || continue
@@ -92,6 +87,7 @@ fi
 [[ -s "$NVM_DIR/bash_completion" ]] && . "$NVM_DIR/bash_completion"
 
 alias at="$HOME/at.sh"
+alias oil="$HOME/oil.sh"
 alias br='brew'
 alias c='clear'
 alias day="$HOME/day.sh"
@@ -116,6 +112,7 @@ alias mb='cd "$HOME/Sites/mikeb.work/"'
 alias nuke="rm -rf"
 alias nv='nvim'
 alias pip='python3 -m pip'
+alias rithmic='wine "$HOME/.wine/drive_c/Program Files (x86)/Rithmic/Rithmic Trader Pro/Rithmic Trader Pro.exe"'
 alias re='source ~/.zshrc'
 alias rename='mv'
 alias scrap='${EDITOR:-nvim} -c "setlocal buftype=nofile bufhidden=wipe noswapfile"'
@@ -140,8 +137,8 @@ setopt PUSHD_IGNORE_DUPS
 
 # Unified identity color matching the banner (RANDOM_COL)
 # Grey timestamp [242] and Green battery [118]
-PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~ %F{242}[%*]%f %F{118}$(pmset -g batt | grep -Eo "\d+%" | cut -d% -f1)%f
-%F{226}%%%f '
+# Fix: use [0-9] instead of \d — $'...' quoting eats the backslash
+PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~ %F{242}[%*]%f %F{242}$(pmset -g batt | grep -Eo "[0-9]+%" | cut -d% -f1)%f\n%F{242}%%%f '
 
 # ── Tmux Auto-Attach ─────────────────────────────────────────────────────────
 if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
