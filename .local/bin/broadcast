@@ -5,24 +5,52 @@ set -euo pipefail
 PORT="8090"
 ROOT_HLS_DIR="/tmp/broadcast-hls"
 FFMPEG="ffmpeg"
-BUMPERS_DIR="$HOME/Documents/Bumpers"
 LOGO_PATH="$HOME/Documents/Prime/logotype.png"
+
+CLOCK_FILE="/tmp/broadcast-clocks-$$.txt"
+WEATHER_FILE="/tmp/broadcast-weather-$$.txt"
+NQ_NOW_FILE="/tmp/broadcast-nq-now-$$.txt"
+NQ_TICKER_FILE="/tmp/broadcast-nq-ticker-$$.txt"
+HEADLINE_FILE="/tmp/broadcast-headlines-$$.txt"
+
+NQ_TICKER_URL="https://weather.mborsare.workers.dev/prime/weather/NQ"
+WEATHER_ZIPS=("02130" "28803" "35242" "37922")
+
+OUTPUT_FPS="24"
+VIDEO_BITRATE="2200k"
+VIDEO_MAXRATE="2600k"
+VIDEO_BUFSIZE="5200k"
+AUDIO_BITRATE="96k"
+HLS_TIME="10"
+HLS_LIST_SIZE="30"
+
 CHANNELS=(
   "looney|Looney Tunes|$HOME/Documents/Looneytunes|1280:720"
 )
 
-# Sentinel file replaces SHUTTING_DOWN variable.
-# Subshells get a copy of variables at fork-time, so SHUTTING_DOWN=1
-# in the parent was invisible to all running loops.
 STOP_FILE="/tmp/broadcast-stop-$$"
 
 cleanup() {
   touch "$STOP_FILE"
   echo -e "\n\033[0;31m[!] Atomic Cleanup Initiated...\033[0m"
-  lsof -ti :$PORT | xargs kill -9 2>/dev/null || true
-  kill $(jobs -p) 2>/dev/null || true
+
+  lsof -ti :"$PORT" | xargs kill -9 2>/dev/null || true
+
+  local pids
+  pids="$(jobs -pr || true)"
+  if [[ -n "$pids" ]]; then
+    kill $pids 2>/dev/null || true
+  fi
+
   pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
+
   rm -f "$STOP_FILE"
+  rm -f "$CLOCK_FILE"
+  rm -f "$WEATHER_FILE"
+  rm -f "$NQ_NOW_FILE"
+  rm -f "$NQ_TICKER_FILE"
+  rm -f "$HEADLINE_FILE"
+
   echo "[+] Broadcast stopped."
   exit 0
 }
@@ -33,13 +61,131 @@ start_server() {
   python3 -m http.server "$PORT" --directory "$ROOT_HLS_DIR" >/tmp/broadcast-server.log 2>&1 &
 }
 
-# Fetches 5 random headlines from NYT RSS via rss2json and joins them
-# into a single ticker string. Returns empty string on any failure so
-# play_file can fall back gracefully — never blocks the stream.
+start_clock_file() {
+  (
+    while [[ ! -f "$STOP_FILE" ]]; do
+      local nq_now
+      nq_now="$(cat "$NQ_NOW_FILE" 2>/dev/null || printf "-----")"
+
+      printf "Now is %s  //  NQ %s\n" \
+        "$(date '+%H:%M:%S')" \
+        "$nq_now" \
+        > "$CLOCK_FILE"
+
+      sleep 1
+    done
+  ) &
+}
+
+start_weather_file() {
+  (
+    while [[ ! -f "$STOP_FILE" ]]; do
+      local parts=()
+      local zip
+      local temp
+      local line
+
+      for zip in "${WEATHER_ZIPS[@]}"; do
+        temp="$(curl -sf --max-time 4 "https://wttr.in/${zip}?format=%t&u" 2>/dev/null | tr -d '+')"
+
+        if [[ -z "$temp" ]]; then
+          temp="--°F"
+        fi
+
+        parts+=("${zip} ${temp}")
+      done
+
+      line="${parts[0]}"
+      for ((i = 1; i < ${#parts[@]}; i++)); do
+        line+="  /  ${parts[$i]}"
+      done
+
+      printf "%s\n" "$line" > "$WEATHER_FILE"
+      sleep 300
+    done
+  ) &
+}
+
+start_nq_ticker_file() {
+  (
+    while [[ ! -f "$STOP_FILE" ]]; do
+      curl -sf --max-time 5 "$NQ_TICKER_URL" \
+        | python3 -c '
+import json
+import math
+import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+nq_now_file = "'"$NQ_NOW_FILE"'"
+
+try:
+    d = json.load(sys.stdin)
+
+    prices = d.get("priceSeries", [])
+    ranges = d.get("rangeSeries", [])
+    as_of_raw = d.get("asOf")
+
+    if not prices or not ranges or not as_of_raw:
+        raise ValueError("missing data")
+
+    as_of = datetime.fromisoformat(as_of_raw.replace("Z", "+00:00"))
+    et = ZoneInfo("America/New_York")
+
+    vals = [float(x) for x in ranges]
+    mean = sum(vals) / len(vals)
+    variance = sum((x - mean) ** 2 for x in vals) / len(vals)
+    std = math.sqrt(variance)
+
+    latest = prices[-1]
+    latest_mid = (float(latest["hi"]) + float(latest["lo"])) / 2
+
+    with open(nq_now_file, "w") as f:
+        f.write(str(int(latest_mid)))
+
+    items = []
+    n = min(len(prices), len(ranges), 42)
+
+    for offset in range(1, n):
+        i = len(prices) - 1 - offset
+        ts = (as_of - timedelta(minutes=offset)).astimezone(et)
+
+        p = prices[i]
+        mid = (float(p["hi"]) + float(p["lo"])) / 2
+        rng = float(ranges[i])
+
+        stamp = ts.strftime("%H:%M")
+        entry = f"{stamp} {int(mid)} {int(rng)}"
+
+        if rng > mean + 2 * std:
+            entry = f"*** {entry} ***"
+        elif rng > mean + std:
+            entry = f"* {entry} *"
+
+        items.append(entry)
+
+    print("      ".join(items))
+
+except Exception:
+    with open(nq_now_file, "w") as f:
+        f.write("-----")
+    print("NQ TAPE UNAVAILABLE")
+' > "$NQ_TICKER_FILE" || {
+          printf -- "-----\n" > "$NQ_NOW_FILE"
+          echo "NQ TAPE UNAVAILABLE" > "$NQ_TICKER_FILE"
+        }
+
+      sleep 60
+    done
+  ) &
+}
+
 fetch_headline() {
   local feed="https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
   local encoded
-  encoded=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$feed")
+
+  encoded="$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$feed")"
+
   curl -sf --max-time 5 "https://api.rss2json.com/v1/api.json?rss_url=$encoded" \
     | python3 -c "
 import json, sys, random
@@ -48,99 +194,130 @@ try:
     items = data.get('items', [])[:10]
     if items:
         picks = [i['title'] for i in random.sample(items, min(5, len(items)))]
-        print('   *   '.join(picks))
+        print('   //   '.join(picks))
 except:
     pass
 " 2>/dev/null || true
 }
 
+start_headline_file() {
+  (
+    while [[ ! -f "$STOP_FILE" ]]; do
+      local headline
+      headline="$(fetch_headline | tr "'\\%[]=" "      ")"
+
+      if [[ -z "$headline" ]]; then
+        headline="PRIME BROADCAST"
+      fi
+
+      printf "%s\n" "$headline" > "$HEADLINE_FILE"
+      echo -e "\033[0;33m[chyron]\033[0m $headline"
+
+      sleep 600
+    done
+  ) &
+}
+
 play_file() {
-  local file="$1" width="$2" height="$3" hls_dir="$4" label="$5"
+  local file="$1"
+  local width="$2"
+  local height="$3"
+  local hls_dir="$4"
+  local label="$5"
+
   [[ -f "$STOP_FILE" ]] && return
+
   echo -e "\033[0;34m[$label]\033[0m Now playing: \033[1m${file##*/}\033[0m"
 
-  # Fetch headline and sanitize for FFmpeg drawtext.
-  # drawtext breaks on: colons, single-quotes, backslashes, percent signs,
-  # square brackets — strip/replace them all before embedding in the filter.
-  local headline
-  headline=$(fetch_headline | tr ":'\\%[]=" "       ")
-  if [[ -z "$headline" ]]; then
-    headline="PRIME BROADCAST"
-  fi
-  echo -e "\033[0;33m[chyron]\033[0m $headline"
-
-  # Filter chain:
-  #   1. setsar=1         — normalize non-square pixels (old broadcast/DVD)
-  #                         so scale works on display dimensions
-  #   2. scale+pad        — fit to target res with black bars, no distortion
-  #   3. force_divisible_by=2 — libx264 requires even pixel dimensions
-  #   4. setsar=1 again   — pad can reintroduce non-1 SAR in container metadata
-  #   5. logo overlay     — top-right corner watermark
-  #   6. drawtext         — scrolling chyron ticker at the bottom
-  #      x=W-mod(t*120,W+tw) scrolls right-to-left at 120px/sec, looping
   local FONT_PATH="/System/Library/Fonts/Supplemental/Comic Sans MS.ttf"
 
   local v_filter
-  v_filter="setsar=1,"
+  v_filter="fps=$OUTPUT_FPS,"
+  v_filter+="setsar=1,"
   v_filter+="scale=$width:$height:force_original_aspect_ratio=decrease:force_divisible_by=2,"
   v_filter+="pad=$width:$height:(ow-iw)/2:(oh-ih)/2,"
   v_filter+="setsar=1,format=yuv420p [main];"
-  v_filter+="movie='$LOGO_PATH',scale=100:-1 [logo];"
-  v_filter+="[main][logo] overlay=W-w-20:20 [combined];"
+  v_filter+="movie='$LOGO_PATH',scale=88:-1 [logo];"
+  v_filter+="[main][logo] overlay=W-w-26:28 [combined];"
+
   v_filter+="[combined] drawtext="
   v_filter+="fontfile='$FONT_PATH':"
-  v_filter+="text='$headline':"
- v_filter+="x=W-mod(t*60\\,W+tw):"
-  v_filter+="y=H-30:"
-  v_filter+="fontsize=18:"
-  v_filter+="fontcolor=white:"
-  v_filter+="box=1:"
-  v_filter+="boxcolor=red@0.65:"
-  v_filter+="boxborderw=6:"
-  v_filter+="shadowcolor=black@0.85:"
-  v_filter+="shadowx=1:"
-  v_filter+="shadowy=1"
+  v_filter+="textfile='$CLOCK_FILE':"
+  v_filter+="reload=1:"
+  v_filter+="x=26:"
+  v_filter+="y=22:"
+  v_filter+="fontsize=15:"
+  v_filter+="fontcolor=0xF4E66A [clocked];"
 
-  # Prefix segment filenames with a timestamp so each FFmpeg invocation
-  # writes unique names. Without this every new process resets to
-  # seg_00000.ts and can stomp segments a slow player is still fetching.
+  v_filter+="[clocked] drawtext="
+  v_filter+="fontfile='$FONT_PATH':"
+  v_filter+="textfile='$WEATHER_FILE':"
+  v_filter+="reload=1:"
+  v_filter+="x=26:"
+  v_filter+="y=44:"
+  v_filter+="fontsize=14:"
+  v_filter+="fontcolor=white [weathered];"
+
+  v_filter+="[weathered] drawtext="
+  v_filter+="fontfile='$FONT_PATH':"
+  v_filter+="textfile='$NQ_TICKER_FILE':"
+  v_filter+="reload=1:"
+  v_filter+="x=W-mod(t*54\\,W+tw):"
+  v_filter+="y=H-68:"
+  v_filter+="fontsize=17:"
+  v_filter+="fontcolor=white [nqtape];"
+
+  v_filter+="[nqtape] drawtext="
+  v_filter+="fontfile='$FONT_PATH':"
+  v_filter+="textfile='$HEADLINE_FILE':"
+  v_filter+="reload=1:"
+  v_filter+="x=W-mod(t*42\\,W+tw):"
+  v_filter+="y=H-36:"
+  v_filter+="fontsize=20:"
+  v_filter+="fontcolor=0xF4E66A"
+
   local seg_prefix
   seg_prefix="$(date +%s)"
 
   "$FFMPEG" -nostdin -hide_banner -loglevel error -re -i "$file" \
     -vf "$v_filter" \
-    -c:v libx264 -preset ultrafast -tune zerolatency -crf 23 -g 60 \
-    -c:a aac -b:a 128k -ar 44100 \
+    -c:v h264_videotoolbox \
+    -profile:v main \
+    -b:v "$VIDEO_BITRATE" \
+    -maxrate "$VIDEO_MAXRATE" \
+    -bufsize "$VIDEO_BUFSIZE" \
+    -g "$((OUTPUT_FPS * HLS_TIME))" \
+    -pix_fmt yuv420p \
+    -c:a aac \
+    -b:a "$AUDIO_BITRATE" \
+    -ar 44100 \
     -f hls \
-    -hls_time 4 \
-    -hls_list_size 10 \
+    -hls_time "$HLS_TIME" \
+    -hls_list_size "$HLS_LIST_SIZE" \
     -hls_flags delete_segments+discont_start \
+    -hls_delete_threshold 30 \
     -hls_segment_filename "$hls_dir/seg_${seg_prefix}_%05d.ts" \
     "$hls_dir/index.m3u8" || true
 }
 
 start_channel() {
-  local name="$1" display_name="$2" media_dir="$3" size="$4"
-  local width="${size%%:*}" height="${size##*:}"
+  local name="$1"
+  local display_name="$2"
+  local media_dir="$3"
+  local size="$4"
+  local width="${size%%:*}"
+  local height="${size##*:}"
   local hls_dir="$ROOT_HLS_DIR/$name"
   local playlist_txt="$hls_dir/files.txt"
-  local bumper_txt="$hls_dir/bumpers.txt"
 
   mkdir -p "$hls_dir"
+
   find "$media_dir" -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.mov" \) | sort > "$playlist_txt"
-  [[ -d "$BUMPERS_DIR" ]] && find "$BUMPERS_DIR" -type f \( -iname "*.mp4" -o -iname "*.mkv" \) > "$bumper_txt"
 
   (
     while [[ ! -f "$STOP_FILE" ]]; do
       shuf "$playlist_txt" | while IFS= read -r episode; do
         [[ -f "$STOP_FILE" ]] && break
-
-        # Bumper logic
-        if [[ -s "$bumper_txt" ]]; then
-          play_file "$(shuf -n 1 "$bumper_txt")" "$width" "$height" "$hls_dir" "$display_name BUMPER"
-        fi
-
-        # Episode logic
         play_file "$episode" "$width" "$height" "$hls_dir" "$display_name"
       done
     done
@@ -150,10 +327,28 @@ start_channel() {
 # --- Execution ---
 pkill -9 -f "python3 -m http.server $PORT" 2>/dev/null || true
 pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
-rm -rf "$ROOT_HLS_DIR" && mkdir -p "$ROOT_HLS_DIR"
+
+rm -rf "$ROOT_HLS_DIR"
+mkdir -p "$ROOT_HLS_DIR"
+
 rm -f "$STOP_FILE"
+rm -f "$CLOCK_FILE"
+rm -f "$WEATHER_FILE"
+rm -f "$NQ_NOW_FILE"
+rm -f "$NQ_TICKER_FILE"
+rm -f "$HEADLINE_FILE"
+
+printf "Now is --:--:--  //  NQ -----\n" > "$CLOCK_FILE"
+printf "02130 --°F  /  28803 --°F  /  35242 --°F  /  37922 --°F\n" > "$WEATHER_FILE"
+printf -- "-----\n" > "$NQ_NOW_FILE"
+printf "NQ TAPE LOADING\n" > "$NQ_TICKER_FILE"
+printf "PRIME BROADCAST\n" > "$HEADLINE_FILE"
 
 start_server
+start_clock_file
+start_weather_file
+start_nq_ticker_file
+start_headline_file
 
 for channel in "${CHANNELS[@]}"; do
   IFS='|' read -r name display_name media_dir size <<< "$channel"
@@ -161,19 +356,24 @@ for channel in "${CHANNELS[@]}"; do
 done
 
 echo "[*] Initializing streams..."
+
 for channel in "${CHANNELS[@]}"; do
   IFS='|' read -r name _ _ _ <<< "$channel"
-  until [[ -f "$ROOT_HLS_DIR/$name/index.m3u8" ]]; do sleep 0.5; done
+  until [[ -f "$ROOT_HLS_DIR/$name/index.m3u8" ]]; do
+    sleep 0.5
+  done
 done
 
 echo -e "\n\033[1;32m------------------------------------------------\033[0m"
 echo -e "\033[1;32m   PRIME BROADCAST LIVE \033[0m"
 echo -e "\033[1;32m------------------------------------------------\033[0m"
+
 for channel in "${CHANNELS[@]}"; do
   IFS='|' read -r name display_name _ _ <<< "$channel"
   echo -e "\033[1mChannel:\033[0m $display_name"
   echo "http://localhost:$PORT/$name/index.m3u8"
   echo ""
 done
+
 echo "Press Ctrl+C to stop."
 wait

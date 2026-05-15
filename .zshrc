@@ -87,7 +87,6 @@ fi
 [[ -s "$NVM_DIR/bash_completion" ]] && . "$NVM_DIR/bash_completion"
 
 alias at="$HOME/at.sh"
-alias oil="$HOME/oil.sh"
 alias br='brew'
 alias c='clear'
 alias day="$HOME/day.sh"
@@ -111,10 +110,11 @@ alias ls='ls -G'
 alias mb='cd "$HOME/Sites/mikeb.work/"'
 alias nuke="rm -rf"
 alias nv='nvim'
+alias oil="$HOME/oil.sh"
 alias pip='python3 -m pip'
-alias rithmic='wine "$HOME/.wine/drive_c/Program Files (x86)/Rithmic/Rithmic Trader Pro/Rithmic Trader Pro.exe"'
 alias re='source ~/.zshrc'
 alias rename='mv'
+alias rithmic='wine "$HOME/.wine/drive_c/Program Files (x86)/Rithmic/Rithmic Trader Pro/Rithmic Trader Pro.exe"'
 alias scrap='${EDITOR:-nvim} -c "setlocal buftype=nofile bufhidden=wipe noswapfile"'
 alias stream='$HOME/stream.sh'
 
