@@ -21,11 +21,11 @@ VIDEO_BITRATE="2200k"
 VIDEO_MAXRATE="2600k"
 VIDEO_BUFSIZE="5200k"
 AUDIO_BITRATE="96k"
-HLS_TIME="10"
-HLS_LIST_SIZE="30"
+HLS_TIME="2"
+HLS_LIST_SIZE="6"
 
 CHANNELS=(
-  "looney|Looney Tunes|$HOME/Documents/Looneytunes|1280:720"
+  "Prime|Prime|$HOME/Documents/Primetv|1280:720"
 )
 
 STOP_FILE="/tmp/broadcast-stop-$$"
@@ -218,18 +218,73 @@ start_headline_file() {
   ) &
 }
 
-play_file() {
-  local file="$1"
-  local width="$2"
-  local height="$3"
-  local hls_dir="$4"
-  local label="$5"
+write_channel_manifest() {
+  local manifest="$ROOT_HLS_DIR/channels.json"
 
-  [[ -f "$STOP_FILE" ]] && return
+  python3 - "$manifest" "${CHANNELS[@]}" <<'PY'
+import json
+import sys
 
-  echo -e "\033[0;34m[$label]\033[0m Now playing: \033[1m${file##*/}\033[0m"
+manifest = sys.argv[1]
+channels = sys.argv[2:]
 
-  local FONT_PATH="/System/Library/Fonts/Supplemental/Comic Sans MS.ttf"
+out = []
+
+for i, raw in enumerate(channels):
+    name, display_name, _media_dir, _size = raw.split("|", 3)
+
+    out.append({
+        "number": f"{i + 3:02d}",
+        "name": display_name.upper(),
+        "path": f"/{name}/index.m3u8"
+    })
+
+with open(manifest, "w", encoding="utf-8") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+PY
+}
+
+write_concat_playlist() {
+  local media_dir="$1"
+  local playlist_ffconcat="$2"
+
+  python3 - "$media_dir" "$playlist_ffconcat" <<'PY'
+import random
+import sys
+from pathlib import Path
+
+media_dir = Path(sys.argv[1]).expanduser()
+playlist = Path(sys.argv[2])
+
+exts = {".mp4", ".mkv", ".mov"}
+files = [
+    p.resolve()
+    for p in media_dir.rglob("*")
+    if p.is_file() and p.suffix.lower() in exts
+]
+
+files.sort(key=lambda p: str(p).lower())
+random.shuffle(files)
+
+if not files:
+    raise SystemExit(f"No media files found in {media_dir}")
+
+def ffconcat_quote(path: Path) -> str:
+    s = str(path)
+    return "'" + s.replace("'", "'\\''") + "'"
+
+with playlist.open("w", encoding="utf-8") as f:
+    f.write("ffconcat version 1.0\n")
+    for path in files:
+        f.write(f"file {ffconcat_quote(path)}\n")
+PY
+}
+
+build_video_filter() {
+  local width="$1"
+  local height="$2"
+  local font_path="/System/Library/Fonts/Supplemental/Comic Sans MS.ttf"
 
   local v_filter
   v_filter="fps=$OUTPUT_FPS,"
@@ -241,7 +296,7 @@ play_file() {
   v_filter+="[main][logo] overlay=W-w-26:28 [combined];"
 
   v_filter+="[combined] drawtext="
-  v_filter+="fontfile='$FONT_PATH':"
+  v_filter+="fontfile='$font_path':"
   v_filter+="textfile='$CLOCK_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=26:"
@@ -250,7 +305,7 @@ play_file() {
   v_filter+="fontcolor=0xF4E66A [clocked];"
 
   v_filter+="[clocked] drawtext="
-  v_filter+="fontfile='$FONT_PATH':"
+  v_filter+="fontfile='$font_path':"
   v_filter+="textfile='$WEATHER_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=26:"
@@ -259,7 +314,7 @@ play_file() {
   v_filter+="fontcolor=white [weathered];"
 
   v_filter+="[weathered] drawtext="
-  v_filter+="fontfile='$FONT_PATH':"
+  v_filter+="fontfile='$font_path':"
   v_filter+="textfile='$NQ_TICKER_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=W-mod(t*54\\,W+tw):"
@@ -268,7 +323,7 @@ play_file() {
   v_filter+="fontcolor=white [nqtape];"
 
   v_filter+="[nqtape] drawtext="
-  v_filter+="fontfile='$FONT_PATH':"
+  v_filter+="fontfile='$font_path':"
   v_filter+="textfile='$HEADLINE_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=W-mod(t*42\\,W+tw):"
@@ -276,28 +331,7 @@ play_file() {
   v_filter+="fontsize=20:"
   v_filter+="fontcolor=0xF4E66A"
 
-  local seg_prefix
-  seg_prefix="$(date +%s)"
-
-  "$FFMPEG" -nostdin -hide_banner -loglevel error -re -i "$file" \
-    -vf "$v_filter" \
-    -c:v h264_videotoolbox \
-    -profile:v main \
-    -b:v "$VIDEO_BITRATE" \
-    -maxrate "$VIDEO_MAXRATE" \
-    -bufsize "$VIDEO_BUFSIZE" \
-    -g "$((OUTPUT_FPS * HLS_TIME))" \
-    -pix_fmt yuv420p \
-    -c:a aac \
-    -b:a "$AUDIO_BITRATE" \
-    -ar 44100 \
-    -f hls \
-    -hls_time "$HLS_TIME" \
-    -hls_list_size "$HLS_LIST_SIZE" \
-    -hls_flags delete_segments+discont_start \
-    -hls_delete_threshold 30 \
-    -hls_segment_filename "$hls_dir/seg_${seg_prefix}_%05d.ts" \
-    "$hls_dir/index.m3u8" || true
+  printf "%s" "$v_filter"
 }
 
 start_channel() {
@@ -308,18 +342,52 @@ start_channel() {
   local width="${size%%:*}"
   local height="${size##*:}"
   local hls_dir="$ROOT_HLS_DIR/$name"
-  local playlist_txt="$hls_dir/files.txt"
+  local playlist_ffconcat="$hls_dir/files.ffconcat"
+  local v_filter
 
   mkdir -p "$hls_dir"
 
-  find "$media_dir" -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.mov" \) | sort > "$playlist_txt"
+  write_concat_playlist "$media_dir" "$playlist_ffconcat"
+  v_filter="$(build_video_filter "$width" "$height")"
+
+  echo -e "\033[0;34m[$display_name]\033[0m Starting always-on channel encoder..."
 
   (
     while [[ ! -f "$STOP_FILE" ]]; do
-      shuf "$playlist_txt" | while IFS= read -r episode; do
-        [[ -f "$STOP_FILE" ]] && break
-        play_file "$episode" "$width" "$height" "$hls_dir" "$display_name"
-      done
+      "$FFMPEG" -nostdin -hide_banner -loglevel warning \
+        -re \
+        -stream_loop -1 \
+        -fflags +genpts+discardcorrupt \
+        -err_detect ignore_err \
+        -f concat \
+        -safe 0 \
+        -i "$playlist_ffconcat" \
+        -vf "$v_filter" \
+        -c:v h264_videotoolbox \
+        -profile:v main \
+        -b:v "$VIDEO_BITRATE" \
+        -maxrate "$VIDEO_MAXRATE" \
+        -bufsize "$VIDEO_BUFSIZE" \
+        -g "$((OUTPUT_FPS * HLS_TIME))" \
+        -pix_fmt yuv420p \
+        -af "aresample=async=1:first_pts=0" \
+        -c:a aac \
+        -b:a "$AUDIO_BITRATE" \
+        -ar 44100 \
+        -ac 2 \
+        -f hls \
+        -hls_time "$HLS_TIME" \
+        -hls_list_size "$HLS_LIST_SIZE" \
+        -hls_start_number_source epoch \
+        -hls_flags delete_segments+omit_endlist+program_date_time+independent_segments \
+        -hls_delete_threshold 30 \
+        -hls_segment_filename "$hls_dir/seg_%d.ts" \
+        "$hls_dir/index.m3u8"
+
+      if [[ ! -f "$STOP_FILE" ]]; then
+        echo -e "\033[0;31m[$display_name]\033[0m Encoder exited. Restarting in 2 seconds..."
+        sleep 2
+      fi
     done
   ) &
 }
@@ -344,6 +412,8 @@ printf -- "-----\n" > "$NQ_NOW_FILE"
 printf "NQ TAPE LOADING\n" > "$NQ_TICKER_FILE"
 printf "PRIME BROADCAST\n" > "$HEADLINE_FILE"
 
+write_channel_manifest
+
 start_server
 start_clock_file
 start_weather_file
@@ -367,6 +437,9 @@ done
 echo -e "\n\033[1;32m------------------------------------------------\033[0m"
 echo -e "\033[1;32m   PRIME BROADCAST LIVE \033[0m"
 echo -e "\033[1;32m------------------------------------------------\033[0m"
+
+echo -e "\033[1mManifest:\033[0m http://localhost:$PORT/channels.json"
+echo ""
 
 for channel in "${CHANNELS[@]}"; do
   IFS='|' read -r name display_name _ _ <<< "$channel"
