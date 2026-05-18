@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+days="${1:-1}"
+limit="${2:-30}"
+
+if ! command -v brew >/dev/null 2>&1; then
+  echo "dailybrew: brew not found"
+  exit 1
+fi
+
+if ! [[ "$days" =~ ^[0-9]+$ ]]; then
+  echo "usage: dailybrew [days] [limit]"
+  exit 1
+fi
+
+if ! [[ "$limit" =~ ^[0-9]+$ ]]; then
+  echo "usage: dailybrew [days] [limit]"
+  exit 1
+fi
+
+prefix="$(brew --prefix)"
+since="$(date -v-"${days}"d +%s)"
+
+show_recent() {
+  local label="$1"
+  local dir="$2"
+
+  echo "$label installed/changed in last ${days} day(s)"
+
+  if [[ ! -d "$dir" ]]; then
+    echo "  none"
+    echo
+    return
+  fi
+
+  stat -f "%m %Sm  %N" -t "%Y-%m-%d %H:%M" "$dir"/* 2>/dev/null \
+    | awk -v since="$since" '
+        $1 >= since {
+          $1="";
+          sub(/^ /,"");
+          print
+        }
+      ' \
+    | sort -r \
+    | head -"$limit" \
+    || true
+
+  echo
+}
+
+show_recent "FORMULAE" "$prefix/Cellar"
+show_recent "CASKS" "$prefix/Caskroom"
