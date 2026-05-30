@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN="primebook"
+TOKEN="4a6ee240-17c4-457b-93ea-12e63342e0a4"
+
+curl -fsS "https://www.duckdns.org/update?domains=${DOMAIN}&token=${TOKEN}&ip="
+echo
