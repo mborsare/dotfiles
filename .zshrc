@@ -5,38 +5,51 @@ export COPYFILE_DISABLE=1
 export EDITOR='nvim'
 export VISUAL='nvim'
 export HOMEBREW_NO_ENV_HINTS=1
-export PATH="/usr/local/opt/openjdk@17/bin:/usr/local/opt/openjdk/bin:$HOME/.local/bin:/usr/local/sbin:$PATH"
 export NVM_DIR="$HOME/.nvm"
-export AERC_CONFIG="$HOME/Library/Preferences/aerc"
+
+# Shared paths first.
+export PATH="$HOME/.local/bin:/usr/local/sbin:$PATH"
+
+# macOS-only paths.
+if [[ "$OSTYPE" == darwin* ]]; then
+  export PATH="/usr/local/opt/openjdk@17/bin:/usr/local/opt/openjdk/bin:$PATH"
+  export AERC_CONFIG="$HOME/Library/Preferences/aerc"
+fi
+
+# Linux-only paths/config.
+if [[ "$OSTYPE" == linux* ]]; then
+  export AERC_CONFIG="$HOME/.config/aerc"
+fi
 
 # ── Login banner ────────────────────────────────────────────────────────────
 if [[ -o interactive ]]; then
   clear
 
-  # 1. Curated "Safe" Palette (Global variable so PROMPT can use it)
-  # Excludes vibrating reds and deep blues for better legibility on black
+  # 1. Curated "Safe" Palette
+  # Excludes vibrating reds and deep blues for better legibility on black.
   prime_colors=(39 45 51 81 87 118 121 159 214 208 141)
   RANDOM_COL=$prime_colors[$(( 1 + RANDOM % $#prime_colors ))]
-  
-  # Start the random theme color
+
+  # Start the random theme color.
   printf "\033[38;5;${RANDOM_COL}m"
 
   cat <<'EOF'
 
-      ██▓███   ██▀███   ██▓ ███▄ ▄███▓▓█████ 
-      ▓██░  ██▒▓██ ▒ ██▒▓██▒▓██▒▀█▀ ██▒▓█   ▀ 
-      ▓██░ ██▓▒▓██ ░▄█ ▒▒██▒▓██    ▓██░▒███   
-      ▒██▄█▓▒ ▒▒██▀▀█▄  ░██░▒██    ▒██ ▒▓█  ▄ 
+      ██▓███   ██▀███   ██▓ ███▄ ▄███▓▓█████
+      ▓██░  ██▒▓██ ▒ ██▒▓██▒▓██▒▀█▀ ██▒▓█   ▀
+      ▓██░ ██▓▒▓██ ░▄█ ▒▒██▒▓██    ▓██░▒███
+      ▒██▄█▓▒ ▒▒██▀▀█▄  ░██░▒██    ▒██ ▒▓█  ▄
       ▒██▒ ░  ░░██▓ ▒██▒░██░▒██▒    ░██▒░▒████▒
       ▒▓▒░ ░  ░░ ▒▓ ░▒▓░░▓  ░ ▒░    ░  ░░░ ▒░ ░
       ░▒ ░        ░▒ ░ ▒░ ▒ ░░  ░      ░ ░ ░  ░
-      ░░          ░░   ░  ▒ ░░      ░      ░   
+      ░░          ░░   ░  ▒ ░░      ░      ░
                   ░      ░          ░      ░  ░
 
       Cyber, art, and risk
 
 EOF
-  # Progress Bar
+
+  # Progress bar.
   loader_width=45
   for pct in 0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100; do
     filled=$(( pct * loader_width / 100 ))
@@ -49,21 +62,20 @@ EOF
 
   printf "\n\n"
 
-  local bio_msg="Access granted. Have a nice day"
-  local yellow="\033[38;5;226m"
-  local reset="\033[0m"
+  bio_msg="Access granted. Have a nice day"
+  yellow="\033[38;5;226m"
+  reset="\033[0m"
 
   for i in {0..6}; do
-    local indent=$(printf '%*s' "$i" '')
+    indent=$(printf '%*s' "$i" '')
     printf "\r\033[K%s%b%s%b" "$indent" "$yellow" "$bio_msg" "$reset"
     sleep 0.015
   done
-  
+
   sleep 0.1
-  printf "\r\033[K      %b%s%b" "$reset" "$bio_msg" "$reset" 
+  printf "\r\033[K      %b%s%b" "$reset" "$bio_msg" "$reset"
   sleep 0.1
-  printf "\r\033[K      %b%s%b\n" "$yellow" "$bio_msg" "$reset" 
-  # ------------------------------------------
+  printf "\r\033[K      %b%s%b\n" "$yellow" "$bio_msg" "$reset"
 
   weather_raw="$(curl -fsSL --max-time 2 'wttr.in/?format=%C+%t+%w' 2>/dev/null || true)"
   printf "\n      \033[38;5;${RANDOM_COL}m%s\033[0m @ \033[38;5;245m%s\033[0m" "${weather_raw:-Weather unavailable}" "$(date '+%Y-%m-%d %H:%M:%S')"
@@ -87,7 +99,6 @@ fi
 [[ -s "$NVM_DIR/bash_completion" ]] && . "$NVM_DIR/bash_completion"
 
 alias at="$HOME/at.sh"
-alias br='brew'
 alias c='clear'
 alias day="$HOME/day.sh"
 alias delete='rm -rv'
@@ -105,13 +116,11 @@ alias gs='git status'
 alias h='cd ~'
 alias http='python3 -m http.server'
 alias ip='dig +short myip.opendns.com @resolver1.opendns.com'
-alias iplocal='ipconfig getifaddr en0'
 alias jump='popd'
 alias jumps='dirs -v'
-alias ls='ls -G'
 alias mb='cd "$HOME/Sites/mikeb.work/"'
 alias mute='sonos mute'
-alias nuke="rm -rf"
+alias nuke='rm -rf'
 alias nv='nvim'
 alias oil="$HOME/oil.sh"
 alias pip='python3 -m pip'
@@ -121,23 +130,53 @@ alias rithmic='wine "$HOME/.wine/drive_c/Program Files (x86)/Rithmic/Rithmic Tra
 alias scrap='${EDITOR:-nvim} -c "setlocal buftype=nofile bufhidden=wipe noswapfile"'
 alias stream='$HOME/stream.sh'
 
+# OS-specific aliases.
+if [[ "$OSTYPE" == darwin* ]]; then
+  alias br='brew'
+  alias ls='ls -G'
+  alias iplocal='ipconfig getifaddr en0'
+elif [[ "$OSTYPE" == linux* ]]; then
+  alias ls='ls --color=auto'
+  alias iplocal="hostname -I | awk '{print \$1}'"
+fi
+
 unalias venv 2>/dev/null
 venv() {
   [[ -d venv ]] || python3 -m venv venv
   source venv/bin/activate
 }
 
-# ── Zsh Settings & Prompt ────────────────────────────────────────────────────
-zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
-zstyle ':completion:*' menu select
+# ── Zsh Settings & Completion ────────────────────────────────────────────────
 export CLICOLOR=1
 export LSCOLORS=ExFxCxDxBxegedabagacad
+
+# Linux color support for completions.
+if [[ "$OSTYPE" == linux* ]] && command -v dircolors >/dev/null 2>&1; then
+  eval "$(dircolors -b)"
+fi
+
 autoload -Uz colors && colors
+autoload -Uz compinit
+
+# Needed for menu-select tab completion.
+zmodload zsh/complist 2>/dev/null
+
+zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
+zstyle ':completion:*' menu select
+zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
+
+# -u ignores insecure completion dir warnings on your own box.
+compinit -u
+
+# Make Tab complete.
+bindkey '^I' expand-or-complete
+
 setopt AUTO_CD
-setopt AUTO_PUSHD 
+setopt AUTO_PUSHD
 setopt PROMPT_SUBST
 setopt PUSHD_IGNORE_DUPS
 
+# ── Prompt helpers ───────────────────────────────────────────────────────────
 battery_pct() {
   if [[ "$OSTYPE" == darwin* ]]; then
     pmset -g batt 2>/dev/null | grep -Eo "[0-9]+%" | head -1 | cut -d% -f1
@@ -149,7 +188,6 @@ battery_pct() {
 }
 
 PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~ %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
-
 
 # ── Tmux Auto-Attach ─────────────────────────────────────────────────────────
 if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
