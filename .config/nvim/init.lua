@@ -5,7 +5,7 @@ vim.g.mapleader = ' '
 vim.g.maplocalleader = ' '
 
 -- Set to true if you have a Nerd Font installed and selected in the terminal.
-vim.g.have_nerd_font = false
+vim.g.have_nerd_font = true
 
 -- [[ Options ]]
 -- See `:help vim.o` and `:help option-list`
@@ -98,10 +98,7 @@ vim.keymap.set('n', '<C-h>', '<C-w><C-h>', { desc = 'Move focus to the left wind
 vim.keymap.set('n', '<C-l>', '<C-w><C-l>', { desc = 'Move focus to the right window' })
 vim.keymap.set('n', '<C-j>', '<C-w><C-j>', { desc = 'Move focus to the lower window' })
 vim.keymap.set('n', '<C-k>', '<C-w><C-k>', { desc = 'Move focus to the upper window' })
---
---
---
---
+
 -- Use leader l to select content between html tags
 vim.keymap.set('n', '<leader>l', 'vit', { noremap = true, silent = true, desc = 'Select inner tag' })
 
@@ -212,7 +209,6 @@ require('lazy').setup({
       { 'nvim-tree/nvim-web-devicons', enabled = vim.g.have_nerd_font },
     },
     config = function()
-      -- See `:help telescope` and `:help telescope.setup()`
       require('telescope').setup {
         extensions = {
           ['ui-select'] = {
@@ -224,7 +220,6 @@ require('lazy').setup({
       pcall(require('telescope').load_extension, 'fzf')
       pcall(require('telescope').load_extension, 'ui-select')
 
-      -- See `:help telescope.builtin`
       local builtin = require 'telescope.builtin'
       vim.keymap.set('n', '<leader>sh', builtin.help_tags, { desc = '[S]earch [H]elp' })
       vim.keymap.set('n', '<leader>sk', builtin.keymaps, { desc = '[S]earch [K]eymaps' })
@@ -340,7 +335,6 @@ require('lazy').setup({
         end,
       })
 
-      -- See `:help vim.diagnostic.Opts`
       vim.diagnostic.config {
         severity_sort = true,
         float = { border = 'rounded', source = 'if_many' },
@@ -371,9 +365,23 @@ require('lazy').setup({
       local capabilities = require('blink.cmp').get_lsp_capabilities()
 
       local servers = {
+        html = {},
+        cssls = {},
+        ts_ls = {},
+
         lua_ls = {
           settings = {
             Lua = {
+              runtime = {
+                version = 'LuaJIT',
+              },
+              diagnostics = {
+                globals = { 'vim' },
+              },
+              workspace = {
+                checkThirdParty = false,
+                library = vim.api.nvim_get_runtime_file('', true),
+              },
               completion = {
                 callSnippet = 'Replace',
               },
@@ -481,7 +489,10 @@ require('lazy').setup({
           end
           return 'make install_jsregexp'
         end)(),
-        dependencies = {},
+        dependencies = { 'rafamadriz/friendly-snippets' },
+        config = function()
+          require('luasnip.loaders.from_vscode').lazy_load()
+        end,
         opts = {},
       },
       'folke/lazydev.nvim',
@@ -490,19 +501,27 @@ require('lazy').setup({
     ---@type blink.cmp.Config
     opts = {
       keymap = {
-        preset = 'default',
-      },
+        preset = 'none',
 
-      appearance = {
-        nerd_font_variant = 'mono',
-      },
+        -- Open / close menu.
+        ['<C-Space>'] = { 'show', 'show_documentation', 'hide_documentation' },
+        ['<C-e>'] = { 'hide', 'fallback' },
 
-      completion = {
-        documentation = { auto_show = false, auto_show_delay_ms = 500 },
+        -- Ctrl + vim directions while menu is open.
+        ['<C-j>'] = { 'select_next', 'fallback' },
+        ['<C-k>'] = { 'select_prev', 'fallback' },
+
+        -- Treat right as accept, left as close.
+        ['<C-l>'] = { 'accept', 'fallback' },
+        ['<C-h>'] = { 'hide', 'fallback' },
+
+        -- Normal accept also works.
+        ['<CR>'] = { 'accept', 'fallback' },
+        ['<Tab>'] = { 'accept', 'fallback' },
       },
 
       sources = {
-        default = { 'lsp', 'path', 'snippets', 'lazydev' },
+        default = { 'lsp', 'path', 'snippets', 'buffer', 'lazydev' },
         providers = {
           lazydev = { module = 'lazydev.integrations.blink', score_offset = 100 },
         },
@@ -557,9 +576,24 @@ require('lazy').setup({
     branch = 'master',
     build = ':TSUpdate',
     main = 'nvim-treesitter.configs',
-    -- See `:help nvim-treesitter`
     opts = {
-      ensure_installed = { 'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown', 'markdown_inline', 'query', 'vim', 'vimdoc' },
+      ensure_installed = {
+        'bash',
+        'c',
+        'css',
+        'diff',
+        'html',
+        'javascript',
+        'json',
+        'lua',
+        'luadoc',
+        'markdown',
+        'markdown_inline',
+        'query',
+        'typescript',
+        'vim',
+        'vimdoc',
+      },
       auto_install = true,
       highlight = {
         enable = true,
@@ -568,14 +602,6 @@ require('lazy').setup({
       indent = { enable = true, disable = { 'ruby' } },
     },
   },
-}, {
-  'rafamadriz/friendly-snippets',
-}, {
-  'L3MON4D3/LuaSnip',
-  dependencies = { 'rafamadriz/friendly-snippets' },
-  config = function()
-    require('luasnip.loaders.from_vscode').lazy_load()
-  end,
 }, {
   ui = {
     icons = vim.g.have_nerd_font and {} or {

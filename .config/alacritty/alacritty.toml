@@ -50,7 +50,6 @@ blink_timeout = 0
 [terminal]
 shell = { program = "/bin/zsh", args = ["-l"] }
 
-# Cmd + [ ] → send Alt + [ ]
 [keyboard]
 bindings = [
   { key = "LBracket", mods = "Command", chars = "\u001b[" },

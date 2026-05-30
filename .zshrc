@@ -138,10 +138,18 @@ setopt AUTO_PUSHD
 setopt PROMPT_SUBST
 setopt PUSHD_IGNORE_DUPS
 
-# Unified identity color matching the banner (RANDOM_COL)
-# Grey timestamp [242] and Green battery [118]
-# Fix: use [0-9] instead of \d — $'...' quoting eats the backslash
-PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~ %F{242}[%*]%f %F{242}$(pmset -g batt | grep -Eo "[0-9]+%" | cut -d% -f1)%f\n%F{242}%%%f '
+battery_pct() {
+  if [[ "$OSTYPE" == darwin* ]]; then
+    pmset -g batt 2>/dev/null | grep -Eo "[0-9]+%" | head -1 | cut -d% -f1
+  elif [[ "$OSTYPE" == linux* ]]; then
+    for bat in /sys/class/power_supply/BAT*/capacity; do
+      [[ -f "$bat" ]] && cat "$bat" && return
+    done
+  fi
+}
+
+PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~ %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
+
 
 # ── Tmux Auto-Attach ─────────────────────────────────────────────────────────
 if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
