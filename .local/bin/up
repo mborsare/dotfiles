@@ -1,0 +1,134 @@
+#!/bin/bash
+set -euo pipefail
+
+DEST="${1:-}"
+
+if [ -z "$DEST" ]; then
+  echo "Usage:"
+  echo "  ./up.sh \"/Volumes/Your Drive Name\""
+  exit 1
+fi
+
+if [ ! -d "$DEST" ]; then
+  echo "Destination does not exist: $DEST"
+  exit 1
+fi
+
+case "$DEST" in
+  /Volumes/*) ;;
+  *)
+    echo "Refusing to write outside /Volumes."
+    echo "Pass your external drive path, like:"
+    echo "  /Volumes/Your Drive Name"
+    exit 1
+    ;;
+esac
+
+MIRROR="$DEST/MacBookMirror"
+HOME_MIRROR="$MIRROR/current/Home"
+META="$MIRROR/current/Meta"
+
+mkdir -p "$HOME_MIRROR" "$META"
+
+echo "Mirroring this Mac to:"
+echo "$MIRROR/current"
+echo ""
+
+cat > "$META/backup-info.txt" <<EOF
+Backup date: $(date)
+User: $USER
+Home: $HOME
+Host: $(hostname)
+macOS: $(sw_vers -productVersion 2>/dev/null || echo unknown)
+EOF
+
+echo "Saving app inventory..."
+
+find /Applications -maxdepth 1 -name "*.app" -print \
+  | sed 's#^/Applications/##' \
+  | sort > "$META/applications.txt" || true
+
+if command -v brew >/dev/null 2>&1; then
+  brew list > "$META/brew-list.txt" || true
+  brew list --cask > "$META/brew-casks.txt" || true
+fi
+
+if command -v code >/dev/null 2>&1; then
+  code --list-extensions > "$META/vscode-extensions.txt" || true
+fi
+
+rsync_home_dir() {
+  local name="$1"
+
+  if [ -e "$HOME/$name" ]; then
+    echo ""
+    echo "Mirroring $name..."
+
+    mkdir -p "$HOME_MIRROR/$name"
+
+    rsync -aE --delete --human-readable --progress \
+      --exclude=".DS_Store" \
+      --exclude=".Trash/" \
+      --exclude="node_modules/" \
+      "$HOME/$name/" "$HOME_MIRROR/$name/"
+  fi
+}
+
+# Human stuff
+rsync_home_dir "Desktop"
+rsync_home_dir "Documents"
+rsync_home_dir "Downloads"
+rsync_home_dir "Pictures"
+rsync_home_dir "Movies"
+rsync_home_dir "Music"
+rsync_home_dir "Public"
+
+echo ""
+echo "Mirroring useful dotfiles/config..."
+
+DOTFILES="$HOME_MIRROR/Dotfiles"
+mkdir -p "$DOTFILES"
+
+for item in \
+  ".zshrc" \
+  ".bashrc" \
+  ".bash_profile" \
+  ".profile" \
+  ".gitconfig" \
+  ".gitignore_global" \
+  ".ssh" \
+  ".config"
+do
+  if [ -e "$HOME/$item" ]; then
+    rsync -aE --delete --human-readable --progress \
+      --exclude=".DS_Store" \
+      "$HOME/$item" "$DOTFILES/"
+  fi
+done
+
+echo ""
+echo "Backing up selected app settings for manual restore..."
+
+MANUAL_LIB="$HOME_MIRROR/Library-Manual-Restore"
+mkdir -p "$MANUAL_LIB"
+
+copy_if_exists() {
+  local src="$1"
+  local dest="$2"
+
+  if [ -e "$src" ]; then
+    mkdir -p "$(dirname "$dest")"
+    rsync -aE --delete --human-readable --progress "$src" "$dest"
+  fi
+}
+
+copy_if_exists "$HOME/Library/Application Support/Code/User" \
+  "$MANUAL_LIB/Application Support/Code/User"
+
+copy_if_exists "$HOME/Library/Preferences" \
+  "$MANUAL_LIB/Preferences"
+
+echo ""
+echo "Done."
+echo "Mirror lives here:"
+echo "$MIRROR/current"

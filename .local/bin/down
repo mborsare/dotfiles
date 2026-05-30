@@ -1,0 +1,113 @@
+#!/bin/bash
+set -euo pipefail
+
+SRC="${1:-}"
+MODE="${2:-dry-run}"
+
+if [ -z "$SRC" ]; then
+  echo "Usage:"
+  echo "  ./down.sh \"/Volumes/Your Drive Name/MacBookMirror/current\""
+  echo ""
+  echo "Dry run first:"
+  echo "  ./down.sh \"/Volumes/Your Drive Name/MacBookMirror/current\""
+  echo ""
+  echo "Actually restore:"
+  echo "  ./down.sh \"/Volumes/Your Drive Name/MacBookMirror/current\" --apply"
+  exit 1
+fi
+
+if [ ! -d "$SRC/Home" ]; then
+  echo "Could not find backup Home folder at:"
+  echo "$SRC/Home"
+  exit 1
+fi
+
+APPLY=false
+if [ "$MODE" = "--apply" ]; then
+  APPLY=true
+elif [ "$MODE" != "dry-run" ]; then
+  echo "Unknown mode: $MODE"
+  echo "Use --apply to actually restore."
+  exit 1
+fi
+
+STAMP="$(date +"%Y-%m-%d_%H-%M-%S")"
+OVERWRITE_BACKUP="$HOME/Desktop/Restore overwritten files - $STAMP"
+
+RSYNC_FLAGS=(-aE --human-readable --itemize-changes)
+
+if [ "$APPLY" = false ]; then
+  RSYNC_FLAGS+=(--dry-run)
+  echo "DRY RUN ONLY. Nothing will be changed."
+else
+  mkdir -p "$OVERWRITE_BACKUP"
+  RSYNC_FLAGS+=(--backup --backup-dir="$OVERWRITE_BACKUP")
+  echo "APPLY MODE."
+  echo "Any overwritten files will be saved here:"
+  echo "$OVERWRITE_BACKUP"
+fi
+
+echo ""
+echo "Restoring from:"
+echo "$SRC"
+echo ""
+
+restore_home_dir() {
+  local name="$1"
+
+  if [ -d "$SRC/Home/$name" ]; then
+    echo ""
+    echo "Restoring $name..."
+
+    mkdir -p "$HOME/$name"
+
+    rsync "${RSYNC_FLAGS[@]}" \
+      "$SRC/Home/$name/" "$HOME/$name/"
+  fi
+}
+
+# Safe restore: no deletes.
+# This copies files back, but does not remove anything from the target Mac.
+restore_home_dir "Desktop"
+restore_home_dir "Documents"
+restore_home_dir "Downloads"
+restore_home_dir "Pictures"
+restore_home_dir "Movies"
+restore_home_dir "Music"
+restore_home_dir "Public"
+
+echo ""
+echo "Restoring dotfiles/config..."
+
+if [ -d "$SRC/Home/Dotfiles" ]; then
+  rsync "${RSYNC_FLAGS[@]}" \
+    "$SRC/Home/Dotfiles/" "$HOME/"
+fi
+
+echo ""
+echo "NOT auto-restoring Library settings."
+echo "They are saved here if needed:"
+echo "$SRC/Home/Library-Manual-Restore"
+echo ""
+echo "This avoids spraying old app guts into a fresh system."
+
+if [ -f "$SRC/Meta/applications.txt" ]; then
+  echo ""
+  echo "Application list:"
+  echo "$SRC/Meta/applications.txt"
+fi
+
+if [ -f "$SRC/Meta/brew-list.txt" ]; then
+  echo ""
+  echo "Brew package list:"
+  echo "$SRC/Meta/brew-list.txt"
+fi
+
+echo ""
+if [ "$APPLY" = false ]; then
+  echo "Dry run complete."
+  echo "To actually restore, run:"
+  echo "  ./down.sh \"$SRC\" --apply"
+else
+  echo "Restore complete."
+fi
