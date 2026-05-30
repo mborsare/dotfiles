@@ -10,23 +10,45 @@ LOGO_PATH="$HOME/Documents/Prime/logotype.png"
 CLOCK_FILE="/tmp/broadcast-clocks-$$.txt"
 WEATHER_FILE="/tmp/broadcast-weather-$$.txt"
 NQ_NOW_FILE="/tmp/broadcast-nq-now-$$.txt"
-NQ_TICKER_FILE="/tmp/broadcast-nq-ticker-$$.txt"
 HEADLINE_FILE="/tmp/broadcast-headlines-$$.txt"
 
-NQ_TICKER_URL="https://weather.mborsare.workers.dev/prime/weather/NQ"
 WEATHER_ZIPS=("02130" "28803" "35242" "37922")
+NQ_NOW_URL="https://weather.mborsare.workers.dev/prime/weather/NQ"
 
 OUTPUT_FPS="24"
-VIDEO_BITRATE="2200k"
-VIDEO_MAXRATE="2600k"
-VIDEO_BUFSIZE="5200k"
+VIDEO_BITRATE="1600k"
+VIDEO_MAXRATE="2000k"
+VIDEO_BUFSIZE="4000k"
 AUDIO_BITRATE="96k"
-HLS_TIME="2"
-HLS_LIST_SIZE="6"
 
-CHANNELS=(
-  "Prime|Prime|$HOME/Documents/Primetv|1280:720"
-)
+HLS_TIME="1"
+HLS_LIST_SIZE="6"
+HLS_DELETE_THRESHOLD="3"
+
+DEFAULT_MEDIA_DIR="$HOME/Documents/Primetv"
+DEFAULT_SIZE="960:540"
+
+CHANNELS=()
+
+if [[ $# -gt 0 ]]; then
+  n=1
+  for input in "$@"; do
+    if [[ ! -e "$input" ]]; then
+      echo "No such file or folder: $input" >&2
+      exit 1
+    fi
+
+    if [[ $# -eq 1 ]]; then
+      CHANNELS+=("Prime|Prime|$input|$DEFAULT_SIZE")
+    else
+      CHANNELS+=("Prime$n|Prime $n|$input|$DEFAULT_SIZE")
+    fi
+
+    n=$((n + 1))
+  done
+else
+  CHANNELS+=("Prime|Prime|$DEFAULT_MEDIA_DIR|$DEFAULT_SIZE")
+fi
 
 STOP_FILE="/tmp/broadcast-stop-$$"
 
@@ -48,7 +70,6 @@ cleanup() {
   rm -f "$CLOCK_FILE"
   rm -f "$WEATHER_FILE"
   rm -f "$NQ_NOW_FILE"
-  rm -f "$NQ_TICKER_FILE"
   rm -f "$HEADLINE_FILE"
 
   echo "[+] Broadcast stopped."
@@ -58,7 +79,36 @@ trap cleanup EXIT INT TERM
 
 start_server() {
   echo "[*] Starting Web Server on port $PORT..."
-  python3 -m http.server "$PORT" --directory "$ROOT_HLS_DIR" >/tmp/broadcast-server.log 2>&1 &
+  PORT="$PORT" ROOT_HLS_DIR="$ROOT_HLS_DIR" python3 - >/tmp/broadcast-server.log 2>&1 <<'PY' &
+import http.server
+import os
+
+PORT = int(os.environ["PORT"])
+ROOT = os.environ["ROOT_HLS_DIR"]
+
+class HLSHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=ROOT, **kwargs)
+
+    def guess_type(self, path):
+        if str(path).endswith(".m3u8"):
+            return "application/vnd.apple.mpegurl"
+        if str(path).endswith(".ts"):
+            return "video/mp2t"
+        if str(path).endswith(".json"):
+            return "application/json"
+        return super().guess_type(path)
+
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+http.server.HTTPServer(("", PORT), HLSHandler).serve_forever()
+PY
 }
 
 start_clock_file() {
@@ -106,36 +156,22 @@ start_weather_file() {
   ) &
 }
 
-start_nq_ticker_file() {
+start_nq_now_file() {
   (
     while [[ ! -f "$STOP_FILE" ]]; do
-      curl -sf --max-time 5 "$NQ_TICKER_URL" \
+      curl -sf --max-time 5 "$NQ_NOW_URL" \
         | python3 -c '
 import json
-import math
 import sys
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
 nq_now_file = "'"$NQ_NOW_FILE"'"
 
 try:
     d = json.load(sys.stdin)
-
     prices = d.get("priceSeries", [])
-    ranges = d.get("rangeSeries", [])
-    as_of_raw = d.get("asOf")
 
-    if not prices or not ranges or not as_of_raw:
+    if not prices:
         raise ValueError("missing data")
-
-    as_of = datetime.fromisoformat(as_of_raw.replace("Z", "+00:00"))
-    et = ZoneInfo("America/New_York")
-
-    vals = [float(x) for x in ranges]
-    mean = sum(vals) / len(vals)
-    variance = sum((x - mean) ** 2 for x in vals) / len(vals)
-    std = math.sqrt(variance)
 
     latest = prices[-1]
     latest_mid = (float(latest["hi"]) + float(latest["lo"])) / 2
@@ -143,37 +179,10 @@ try:
     with open(nq_now_file, "w") as f:
         f.write(str(int(latest_mid)))
 
-    items = []
-    n = min(len(prices), len(ranges), 42)
-
-    for offset in range(1, n):
-        i = len(prices) - 1 - offset
-        ts = (as_of - timedelta(minutes=offset)).astimezone(et)
-
-        p = prices[i]
-        mid = (float(p["hi"]) + float(p["lo"])) / 2
-        rng = float(ranges[i])
-
-        stamp = ts.strftime("%H:%M")
-        entry = f"{stamp} {int(mid)} {int(rng)}"
-
-        if rng > mean + 2 * std:
-            entry = f"*** {entry} ***"
-        elif rng > mean + std:
-            entry = f"* {entry} *"
-
-        items.append(entry)
-
-    print("      ".join(items))
-
 except Exception:
     with open(nq_now_file, "w") as f:
         f.write("-----")
-    print("NQ TAPE UNAVAILABLE")
-' > "$NQ_TICKER_FILE" || {
-          printf -- "-----\n" > "$NQ_NOW_FILE"
-          echo "NQ TAPE UNAVAILABLE" > "$NQ_TICKER_FILE"
-        }
+' || printf -- "-----\n" > "$NQ_NOW_FILE"
 
       sleep 60
     done
@@ -188,14 +197,19 @@ fetch_headline() {
 
   curl -sf --max-time 5 "https://api.rss2json.com/v1/api.json?rss_url=$encoded" \
     | python3 -c "
-import json, sys, random
+import json
+import sys
+import random
+
 try:
     data = json.load(sys.stdin)
     items = data.get('items', [])[:10]
+
     if items:
-        picks = [i['title'] for i in random.sample(items, min(5, len(items)))]
+        picks = [i.get('title', '') for i in random.sample(items, min(5, len(items)))]
+        picks = [p for p in picks if p]
         print('   //   '.join(picks))
-except:
+except Exception:
     pass
 " 2>/dev/null || true
 }
@@ -231,7 +245,7 @@ channels = sys.argv[2:]
 out = []
 
 for i, raw in enumerate(channels):
-    name, display_name, _media_dir, _size = raw.split("|", 3)
+    name, display_name, _media_path, _size = raw.split("|", 3)
 
     out.append({
         "number": f"{i + 3:02d}",
@@ -246,29 +260,34 @@ PY
 }
 
 write_concat_playlist() {
-  local media_dir="$1"
+  local media_path="$1"
   local playlist_ffconcat="$2"
 
-  python3 - "$media_dir" "$playlist_ffconcat" <<'PY'
+  python3 - "$media_path" "$playlist_ffconcat" <<'PY'
 import random
 import sys
 from pathlib import Path
 
-media_dir = Path(sys.argv[1]).expanduser()
+media_path = Path(sys.argv[1]).expanduser()
 playlist = Path(sys.argv[2])
 
-exts = {".mp4", ".mkv", ".mov"}
-files = [
-    p.resolve()
-    for p in media_dir.rglob("*")
-    if p.is_file() and p.suffix.lower() in exts
-]
+exts = {".mp4", ".mkv", ".mov", ".m4v"}
 
-files.sort(key=lambda p: str(p).lower())
-random.shuffle(files)
+if media_path.is_file():
+    files = [media_path.resolve()]
+elif media_path.is_dir():
+    files = [
+        p.resolve()
+        for p in media_path.rglob("*")
+        if p.is_file() and p.suffix.lower() in exts
+    ]
+    files.sort(key=lambda p: str(p).lower())
+    random.shuffle(files)
+else:
+    raise SystemExit(f"No such file or folder: {media_path}")
 
 if not files:
-    raise SystemExit(f"No media files found in {media_dir}")
+    raise SystemExit(f"No media files found in {media_path}")
 
 def ffconcat_quote(path: Path) -> str:
     s = str(path)
@@ -292,15 +311,20 @@ build_video_filter() {
   v_filter+="scale=$width:$height:force_original_aspect_ratio=decrease:force_divisible_by=2,"
   v_filter+="pad=$width:$height:(ow-iw)/2:(oh-ih)/2,"
   v_filter+="setsar=1,format=yuv420p [main];"
-  v_filter+="movie='$LOGO_PATH',scale=88:-1 [logo];"
-  v_filter+="[main][logo] overlay=W-w-26:28 [combined];"
+
+  if [[ -f "$LOGO_PATH" ]]; then
+    v_filter+="movie='$LOGO_PATH',scale=76:-1 [logo];"
+    v_filter+="[main][logo] overlay=W-w-22:24 [combined];"
+  else
+    v_filter+="[main] null [combined];"
+  fi
 
   v_filter+="[combined] drawtext="
   v_filter+="fontfile='$font_path':"
   v_filter+="textfile='$CLOCK_FILE':"
   v_filter+="reload=1:"
-  v_filter+="x=26:"
-  v_filter+="y=22:"
+  v_filter+="x=24:"
+  v_filter+="y=20:"
   v_filter+="fontsize=15:"
   v_filter+="fontcolor=0xF4E66A [clocked];"
 
@@ -308,21 +332,12 @@ build_video_filter() {
   v_filter+="fontfile='$font_path':"
   v_filter+="textfile='$WEATHER_FILE':"
   v_filter+="reload=1:"
-  v_filter+="x=26:"
-  v_filter+="y=44:"
-  v_filter+="fontsize=14:"
+  v_filter+="x=24:"
+  v_filter+="y=42:"
+  v_filter+="fontsize=13:"
   v_filter+="fontcolor=white [weathered];"
 
   v_filter+="[weathered] drawtext="
-  v_filter+="fontfile='$font_path':"
-  v_filter+="textfile='$NQ_TICKER_FILE':"
-  v_filter+="reload=1:"
-  v_filter+="x=W-mod(t*54\\,W+tw):"
-  v_filter+="y=H-68:"
-  v_filter+="fontsize=17:"
-  v_filter+="fontcolor=white [nqtape];"
-
-  v_filter+="[nqtape] drawtext="
   v_filter+="fontfile='$font_path':"
   v_filter+="textfile='$HEADLINE_FILE':"
   v_filter+="reload=1:"
@@ -337,7 +352,7 @@ build_video_filter() {
 start_channel() {
   local name="$1"
   local display_name="$2"
-  local media_dir="$3"
+  local media_path="$3"
   local size="$4"
   local width="${size%%:*}"
   local height="${size##*:}"
@@ -347,10 +362,11 @@ start_channel() {
 
   mkdir -p "$hls_dir"
 
-  write_concat_playlist "$media_dir" "$playlist_ffconcat"
+  write_concat_playlist "$media_path" "$playlist_ffconcat"
   v_filter="$(build_video_filter "$width" "$height")"
 
-  echo -e "\033[0;34m[$display_name]\033[0m Starting always-on channel encoder..."
+  echo -e "\033[0;34m[$display_name]\033[0m Starting efficient always-on channel encoder..."
+  echo "source: $media_path"
 
   (
     while [[ ! -f "$STOP_FILE" ]]; do
@@ -363,7 +379,8 @@ start_channel() {
         -safe 0 \
         -i "$playlist_ffconcat" \
         -vf "$v_filter" \
-        -c:v h264_videotoolbox \
+        -c:v libx264 \
+        -preset veryfast \
         -profile:v main \
         -b:v "$VIDEO_BITRATE" \
         -maxrate "$VIDEO_MAXRATE" \
@@ -380,7 +397,7 @@ start_channel() {
         -hls_list_size "$HLS_LIST_SIZE" \
         -hls_start_number_source epoch \
         -hls_flags delete_segments+omit_endlist+program_date_time+independent_segments \
-        -hls_delete_threshold 30 \
+        -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
         -hls_segment_filename "$hls_dir/seg_%d.ts" \
         "$hls_dir/index.m3u8"
 
@@ -393,7 +410,7 @@ start_channel() {
 }
 
 # --- Execution ---
-pkill -9 -f "python3 -m http.server $PORT" 2>/dev/null || true
+lsof -ti :"$PORT" | xargs kill -9 2>/dev/null || true
 pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
 
 rm -rf "$ROOT_HLS_DIR"
@@ -403,13 +420,11 @@ rm -f "$STOP_FILE"
 rm -f "$CLOCK_FILE"
 rm -f "$WEATHER_FILE"
 rm -f "$NQ_NOW_FILE"
-rm -f "$NQ_TICKER_FILE"
 rm -f "$HEADLINE_FILE"
 
 printf "Now is --:--:--  //  NQ -----\n" > "$CLOCK_FILE"
 printf "02130 --°F  /  28803 --°F  /  35242 --°F  /  37922 --°F\n" > "$WEATHER_FILE"
 printf -- "-----\n" > "$NQ_NOW_FILE"
-printf "NQ TAPE LOADING\n" > "$NQ_TICKER_FILE"
 printf "PRIME BROADCAST\n" > "$HEADLINE_FILE"
 
 write_channel_manifest
@@ -417,12 +432,12 @@ write_channel_manifest
 start_server
 start_clock_file
 start_weather_file
-start_nq_ticker_file
+start_nq_now_file
 start_headline_file
 
 for channel in "${CHANNELS[@]}"; do
-  IFS='|' read -r name display_name media_dir size <<< "$channel"
-  start_channel "$name" "$display_name" "$media_dir" "$size"
+  IFS='|' read -r name display_name media_path size <<< "$channel"
+  start_channel "$name" "$display_name" "$media_path" "$size"
 done
 
 echo "[*] Initializing streams..."
@@ -442,8 +457,9 @@ echo -e "\033[1mManifest:\033[0m http://localhost:$PORT/channels.json"
 echo ""
 
 for channel in "${CHANNELS[@]}"; do
-  IFS='|' read -r name display_name _ _ <<< "$channel"
+  IFS='|' read -r name display_name media_path _ <<< "$channel"
   echo -e "\033[1mChannel:\033[0m $display_name"
+  echo "Source: $media_path"
   echo "http://localhost:$PORT/$name/index.m3u8"
   echo ""
 done
