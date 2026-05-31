@@ -4,3 +4,4 @@ set -euo pipefail
 source "$HOME/.config/duckdns/duckdns.env"
 
 curl -fsS "https://www.duckdns.org/update?domains=${DUCKDNS_DOMAIN}&token=${DUCKDNS_TOKEN}&ip="
+echo
