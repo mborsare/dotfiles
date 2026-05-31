@@ -6,8 +6,8 @@ DEST_USER="${XEROX_DEST_USER:-mikeb}"
 DEST_DIR="${XEROX_DEST_DIR:-Documents/Primetv}"
 
 usage() {
-  printf 'usage: xerox DIR\n' >&2
-  printf 'copies DIR to %s@%s:~/%s/\n' "$DEST_USER" "$DEST_HOST" "$DEST_DIR" >&2
+  printf 'usage: xerox PATH\n' >&2
+  printf 'copies file or directory PATH to %s@%s:~/%s/\n' "$DEST_USER" "$DEST_HOST" "$DEST_DIR" >&2
 }
 
 if [[ $# -ne 1 ]]; then
@@ -17,17 +17,24 @@ fi
 
 src=${1%/}
 
-if [[ ! -d "$src" ]]; then
-  printf 'xerox: not a directory: %s\n' "$src" >&2
+if [[ ! -e "$src" ]]; then
+  printf 'xerox: no such file or directory: %s\n' "$src" >&2
   exit 1
 fi
 
-dir_name=$(basename "$src")
+name=$(basename "$src")
 parent_dir=$(cd "$(dirname "$src")" && pwd -P)
 
-printf 'Copying %s/%s -> %s@%s:~/%s/%s\n' \
-  "$parent_dir" "$dir_name" "$DEST_USER" "$DEST_HOST" "$DEST_DIR" "$dir_name"
-
 ssh "$DEST_USER@$DEST_HOST" "mkdir -p ~/'$DEST_DIR'"
-rsync -avh --info=progress2 "$parent_dir/$dir_name/" \
-  "$DEST_USER@$DEST_HOST:~/$DEST_DIR/$dir_name/"
+
+if [[ -d "$src" ]]; then
+  printf 'Copying %s/%s -> %s@%s:~/%s/%s\n' \
+    "$parent_dir" "$name" "$DEST_USER" "$DEST_HOST" "$DEST_DIR" "$name"
+  rsync -avh --progress "$parent_dir/$name/" \
+    "$DEST_USER@$DEST_HOST:~/$DEST_DIR/$name/"
+else
+  printf 'Copying %s/%s -> %s@%s:~/%s/%s\n' \
+    "$parent_dir" "$name" "$DEST_USER" "$DEST_HOST" "$DEST_DIR" "$name"
+  rsync -avh --progress "$parent_dir/$name" \
+    "$DEST_USER@$DEST_HOST:~/$DEST_DIR/"
+fi
