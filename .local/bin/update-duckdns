@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN="primebook"
-TOKEN="ea97fb04-d508-4b5c-aa87-e29afe3a1bed"
+source "$HOME/.config/duckdns/duckdns.env"
 
-curl -fsS "https://www.duckdns.org/update?domains=${DOMAIN}&token=${TOKEN}&ip="
-echo
+curl -fsS "https://www.duckdns.org/update?domains=${DUCKDNS_DOMAIN}&token=${DUCKDNS_TOKEN}&ip="
