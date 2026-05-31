@@ -2,7 +2,7 @@
 set -euo pipefail
 
 DOMAIN="primebook"
-TOKEN="4a6ee240-17c4-457b-93ea-12e63342e0a4"
+TOKEN="ea97fb04-d508-4b5c-aa87-e29afe3a1bed"
 
 curl -fsS "https://www.duckdns.org/update?domains=${DOMAIN}&token=${TOKEN}&ip="
 echo
