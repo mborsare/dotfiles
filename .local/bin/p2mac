@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEST_HOST="${XEROX_DEST_HOST:-primebook.prime}"
+DEST_USER="${XEROX_DEST_USER:-mikeb}"
+
+read_clipboard() {
+  if [[ ! -t 0 ]]; then
+    cat
+    return
+  fi
+
+  if command -v wl-paste >/dev/null 2>&1; then
+    wl-paste
+  elif command -v xclip >/dev/null 2>&1; then
+    xclip -selection clipboard -o
+  elif command -v xsel >/dev/null 2>&1; then
+    xsel --clipboard --output
+  elif command -v pbpaste >/dev/null 2>&1; then
+    pbpaste
+  else
+    printf 'p2mac: no stdin and no clipboard reader found\n' >&2
+    exit 1
+  fi
+}
+
+read_clipboard | ssh "$DEST_USER@$DEST_HOST" pbcopy

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEST_HOST="${CC_DEST_HOST:-oldbook.prime}"
+DEST_USER="${CC_DEST_USER:-mikeb}"
+
+read_clipboard() {
+  if [[ ! -t 0 ]]; then
+    cat
+    return
+  fi
+
+  if command -v pbpaste >/dev/null 2>&1; then
+    pbpaste
+  elif command -v wl-paste >/dev/null 2>&1; then
+    wl-paste
+  elif command -v xclip >/dev/null 2>&1; then
+    xclip -selection clipboard -o
+  elif command -v xsel >/dev/null 2>&1; then
+    xsel --clipboard --output
+  else
+    printf 'p2linux: no stdin and no clipboard reader found\n' >&2
+    exit 1
+  fi
+}
+
+read_clipboard | ssh "$DEST_USER@$DEST_HOST" '
+  if command -v wl-copy >/dev/null 2>&1; then
+    wl-copy
+  elif command -v xclip >/dev/null 2>&1; then
+    xclip -selection clipboard
+  elif command -v xsel >/dev/null 2>&1; then
+    xsel --clipboard --input
+  else
+    printf "p2linux: no clipboard writer found on remote linux host\n" >&2
+    exit 1
+  fi
+'
