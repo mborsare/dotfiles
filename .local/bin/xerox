@@ -1,19 +1,74 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEST_HOST="${XEROX_DEST_HOST:-192.168.50.53}"
+DEST_NAME="${XEROX_DEST:-prime}"
+DEST_HOST="${XEROX_DEST_HOST:-}"
 DEST_USER="${XEROX_DEST_USER:-mikeb}"
-DEST_DIR="${XEROX_DEST_DIR:-Documents/Primetv}"
+DEST_DIR="${XEROX_DEST_DIR:-}"
 
 usage() {
-  printf 'usage: xerox PATH\n' >&2
-  printf 'copies file or directory PATH to %s@%s:~/%s/\n' "$DEST_USER" "$DEST_HOST" "$DEST_DIR" >&2
+  cat >&2 <<'EOF_USAGE'
+usage:
+  xerox PATH
+  xerox DEST PATH
+  xerox --to DEST PATH
+
+destinations:
+  prime      copies to mikeb@192.168.50.53:~/Documents/Primetv/
+  oldcloud   copies to mikeb@192.168.50.53:~/oldcloud/
+
+env overrides:
+  XEROX_DEST, XEROX_DEST_HOST, XEROX_DEST_USER, XEROX_DEST_DIR
+EOF_USAGE
 }
 
-if [[ $# -ne 1 ]]; then
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -t|--to)
+      if [[ $# -lt 2 ]]; then
+        usage
+        exit 2
+      fi
+      DEST_NAME="$2"
+      shift 2
+      ;;
+    --to=*)
+      DEST_NAME="${1#--to=}"
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -eq 2 ]]; then
+  DEST_NAME="$1"
+  shift
+elif [[ $# -ne 1 ]]; then
   usage
   exit 2
 fi
+
+case "$DEST_NAME" in
+  prime|primetv)
+    DEST_HOST="${DEST_HOST:-192.168.50.53}"
+    DEST_DIR="${DEST_DIR:-Documents/Primetv}"
+    ;;
+  oldcloud|cloud|oc)
+    DEST_HOST="${DEST_HOST:-192.168.50.53}"
+    DEST_DIR="${DEST_DIR:-oldcloud}"
+    ;;
+  *)
+    printf 'xerox: unknown destination: %s\n\n' "$DEST_NAME" >&2
+    usage
+    exit 2
+    ;;
+esac
 
 src=${1%/}
 
