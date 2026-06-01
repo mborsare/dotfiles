@@ -25,6 +25,16 @@ read_clipboard() {
 }
 
 read_clipboard | ssh "$DEST_USER@$DEST_HOST" '
+  detach_clipboard_writer() {
+    tmp=$(mktemp "${TMPDIR:-/tmp}/p2linux.XXXXXX")
+    cat > "$tmp"
+    (
+      trap "" HUP
+      "$@" < "$tmp" >/dev/null 2>&1
+      rm -f "$tmp"
+    ) </dev/null >/dev/null 2>&1 &
+  }
+
   if command -v wl-copy >/dev/null 2>&1; then
     uid=$(id -u)
     XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
@@ -38,11 +48,11 @@ read_clipboard | ssh "$DEST_USER@$DEST_HOST" '
     fi
 
     export XDG_RUNTIME_DIR WAYLAND_DISPLAY
-    wl-copy
+    detach_clipboard_writer wl-copy
   elif command -v xclip >/dev/null 2>&1; then
-    xclip -selection clipboard
+    detach_clipboard_writer xclip -selection clipboard
   elif command -v xsel >/dev/null 2>&1; then
-    xsel --clipboard --input
+    detach_clipboard_writer xsel --clipboard --input
   else
     printf "p2linux: no clipboard writer found on remote linux host\n" >&2
     exit 1
