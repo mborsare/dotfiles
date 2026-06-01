@@ -26,6 +26,18 @@ read_clipboard() {
 
 read_clipboard | ssh "$DEST_USER@$DEST_HOST" '
   if command -v wl-copy >/dev/null 2>&1; then
+    uid=$(id -u)
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$uid}"
+
+    if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+      for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+        [ -S "$socket" ] || continue
+        WAYLAND_DISPLAY=$(basename "$socket")
+        break
+      done
+    fi
+
+    export XDG_RUNTIME_DIR WAYLAND_DISPLAY
     wl-copy
   elif command -v xclip >/dev/null 2>&1; then
     xclip -selection clipboard
