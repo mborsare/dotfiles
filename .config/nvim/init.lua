@@ -418,6 +418,13 @@ require('lazy').setup({
       {
         '<leader>f',
         function()
+          local filetype = vim.bo.filetype
+
+          if filetype == 'html' then
+            vim.cmd.write()
+            return
+          end
+
           require('conform').format { async = true, lsp_format = 'fallback' }
         end,
         mode = '',
