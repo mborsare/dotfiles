@@ -3,16 +3,17 @@ set -euo pipefail
 
 # --- Configuration ---
 PORT="8090"
+BIND_ADDR="127.0.0.1"
 ROOT_HLS_DIR="/tmp/broadcast-hls"
 FFMPEG="ffmpeg"
 LOGO_PATH="$HOME/Documents/Prime/logotype.png"
+SERVER_PID=""
 
 CLOCK_FILE="/tmp/broadcast-clocks-$$.txt"
-WEATHER_FILE="/tmp/broadcast-weather-$$.txt"
 NQ_NOW_FILE="/tmp/broadcast-nq-now-$$.txt"
 HEADLINE_FILE="/tmp/broadcast-headlines-$$.txt"
+SLEEP_FILE="/tmp/broadcast-sleep.txt"
 
-WEATHER_ZIPS=("02130" "28803" "35242" "37922")
 NQ_NOW_URL="https://weather.mborsare.workers.dev/prime/weather/NQ"
 
 OUTPUT_FPS="24"
@@ -52,11 +53,49 @@ fi
 
 STOP_FILE="/tmp/broadcast-stop-$$"
 
+kill_port_listeners() {
+  local pids=""
+
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -ti :"$PORT" 2>/dev/null || true)"
+  elif command -v fuser >/dev/null 2>&1; then
+    pids="$(fuser -n tcp "$PORT" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$pids" ]]; then
+    kill -9 $pids 2>/dev/null || true
+  fi
+}
+
+require_runtime() {
+  local missing=()
+  local cmd
+
+  for cmd in "$FFMPEG" python3 curl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if ! command -v lsof >/dev/null 2>&1 && ! command -v fuser >/dev/null 2>&1; then
+    missing+=("lsof or fuser")
+  fi
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Missing required app(s): ${missing[*]}" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$LOGO_PATH" ]]; then
+    echo "[warn] Logo not found, continuing without logo: $LOGO_PATH" >&2
+  fi
+}
+
 cleanup() {
   touch "$STOP_FILE"
   echo -e "\n\033[0;31m[!] Atomic Cleanup Initiated...\033[0m"
 
-  lsof -ti :"$PORT" | xargs kill -9 2>/dev/null || true
+  kill_port_listeners
 
   local pids
   pids="$(jobs -pr || true)"
@@ -65,12 +104,13 @@ cleanup() {
   fi
 
   pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
+  rm -rf "$ROOT_HLS_DIR"
 
   rm -f "$STOP_FILE"
   rm -f "$CLOCK_FILE"
-  rm -f "$WEATHER_FILE"
   rm -f "$NQ_NOW_FILE"
   rm -f "$HEADLINE_FILE"
+  : > "$SLEEP_FILE"
 
   echo "[+] Broadcast stopped."
   exit 0
@@ -78,11 +118,12 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 start_server() {
-  echo "[*] Starting Web Server on port $PORT..."
-  PORT="$PORT" ROOT_HLS_DIR="$ROOT_HLS_DIR" python3 - >/tmp/broadcast-server.log 2>&1 <<'PY' &
+  echo "[*] Starting Web Server on $BIND_ADDR:$PORT..."
+  BIND_ADDR="$BIND_ADDR" PORT="$PORT" ROOT_HLS_DIR="$ROOT_HLS_DIR" python3 - >/tmp/broadcast-server.log 2>&1 <<'PY' &
 import http.server
 import os
 
+BIND_ADDR = os.environ["BIND_ADDR"]
 PORT = int(os.environ["PORT"])
 ROOT = os.environ["ROOT_HLS_DIR"]
 
@@ -107,8 +148,32 @@ class HLSHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-http.server.HTTPServer(("", PORT), HLSHandler).serve_forever()
+http.server.HTTPServer((BIND_ADDR, PORT), HLSHandler).serve_forever()
 PY
+  SERVER_PID="$!"
+}
+
+wait_for_server() {
+  local url="http://127.0.0.1:$PORT/channels.json"
+  local i
+
+  for i in {1..50}; do
+    if curl -sf --max-time 1 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "[error] Web server exited before it was reachable." >&2
+      cat /tmp/broadcast-server.log >&2 2>/dev/null || true
+      exit 1
+    fi
+
+    sleep 0.1
+  done
+
+  echo "[error] Web server did not become reachable at $url" >&2
+  cat /tmp/broadcast-server.log >&2 2>/dev/null || true
+  exit 1
 }
 
 start_clock_file() {
@@ -123,35 +188,6 @@ start_clock_file() {
         > "$CLOCK_FILE"
 
       sleep 1
-    done
-  ) &
-}
-
-start_weather_file() {
-  (
-    while [[ ! -f "$STOP_FILE" ]]; do
-      local parts=()
-      local zip
-      local temp
-      local line
-
-      for zip in "${WEATHER_ZIPS[@]}"; do
-        temp="$(curl -sf --max-time 4 "https://wttr.in/${zip}?format=%t&u" 2>/dev/null | tr -d '+')"
-
-        if [[ -z "$temp" ]]; then
-          temp="--°F"
-        fi
-
-        parts+=("${zip} ${temp}")
-      done
-
-      line="${parts[0]}"
-      for ((i = 1; i < ${#parts[@]}; i++)); do
-        line+="  /  ${parts[$i]}"
-      done
-
-      printf "%s\n" "$line" > "$WEATHER_FILE"
-      sleep 300
     done
   ) &
 }
@@ -303,7 +339,20 @@ PY
 build_video_filter() {
   local width="$1"
   local height="$2"
-  local font_path="/System/Library/Fonts/Supplemental/Comic Sans MS.ttf"
+  local font_path=""
+  local font_arg=""
+
+  if command -v fc-match >/dev/null 2>&1; then
+    font_path="$(fc-match -f '%{file}\n' 'ComicShannsMono Nerd Font' 2>/dev/null | head -n 1 || true)"
+  fi
+
+  if [[ -z "$font_path" || ! -f "$font_path" ]]; then
+    font_path="/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf"
+  fi
+
+  if [[ -f "$font_path" ]]; then
+    font_arg="fontfile='$font_path':"
+  fi
 
   local v_filter
   v_filter="fps=$OUTPUT_FPS,"
@@ -320,7 +369,7 @@ build_video_filter() {
   fi
 
   v_filter+="[combined] drawtext="
-  v_filter+="fontfile='$font_path':"
+  v_filter+="$font_arg"
   v_filter+="textfile='$CLOCK_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=24:"
@@ -329,22 +378,25 @@ build_video_filter() {
   v_filter+="fontcolor=0xF4E66A [clocked];"
 
   v_filter+="[clocked] drawtext="
-  v_filter+="fontfile='$font_path':"
-  v_filter+="textfile='$WEATHER_FILE':"
-  v_filter+="reload=1:"
-  v_filter+="x=24:"
-  v_filter+="y=42:"
-  v_filter+="fontsize=13:"
-  v_filter+="fontcolor=white [weathered];"
-
-  v_filter+="[weathered] drawtext="
-  v_filter+="fontfile='$font_path':"
+  v_filter+="$font_arg"
   v_filter+="textfile='$HEADLINE_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=W-mod(t*42\\,W+tw):"
   v_filter+="y=H-36:"
   v_filter+="fontsize=20:"
-  v_filter+="fontcolor=0xF4E66A"
+  v_filter+="fontcolor=0xF4E66A [headlined];"
+
+  v_filter+="[headlined] drawtext="
+  v_filter+="$font_arg"
+  v_filter+="textfile='$SLEEP_FILE':"
+  v_filter+="reload=1:"
+  v_filter+="x=W-tw-24:"
+  v_filter+="y=H-th-62:"
+  v_filter+="fontsize=18:"
+  v_filter+="fontcolor=white:"
+  v_filter+="box=1:"
+  v_filter+="boxcolor=black@0.55:"
+  v_filter+="boxborderw=8"
 
   printf "%s" "$v_filter"
 }
@@ -410,7 +462,9 @@ start_channel() {
 }
 
 # --- Execution ---
-lsof -ti :"$PORT" | xargs kill -9 2>/dev/null || true
+require_runtime
+
+kill_port_listeners
 pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
 
 rm -rf "$ROOT_HLS_DIR"
@@ -418,20 +472,19 @@ mkdir -p "$ROOT_HLS_DIR"
 
 rm -f "$STOP_FILE"
 rm -f "$CLOCK_FILE"
-rm -f "$WEATHER_FILE"
 rm -f "$NQ_NOW_FILE"
 rm -f "$HEADLINE_FILE"
 
 printf "Now is --:--:--  //  NQ -----\n" > "$CLOCK_FILE"
-printf "02130 --°F  /  28803 --°F  /  35242 --°F  /  37922 --°F\n" > "$WEATHER_FILE"
 printf -- "-----\n" > "$NQ_NOW_FILE"
 printf "PRIME BROADCAST\n" > "$HEADLINE_FILE"
+: > "$SLEEP_FILE"
 
 write_channel_manifest
 
 start_server
+wait_for_server
 start_clock_file
-start_weather_file
 start_nq_now_file
 start_headline_file
 
