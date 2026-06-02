@@ -8,7 +8,7 @@ export HOMEBREW_NO_ENV_HINTS=1
 export NVM_DIR="$HOME/.nvm"
 
 # Shared paths first.
-export PATH="$HOME/.local/bin:/usr/local/sbin:$PATH"
+export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:$PATH"
 
 # macOS-only paths.
 if [[ "$OSTYPE" == darwin* ]]; then
@@ -114,7 +114,8 @@ alias gd='git diff'
 alias gp='git push'
 alias gs='git status'
 alias h='cd ~'
-alias http='python3 -m http.server'
+alias httpsnake='python3 -m http.server'
+alias httpgolf='caddy file-server --listen :8080 --browse'
 alias ip='dig +short myip.opendns.com @resolver1.opendns.com'
 alias jump='popd'
 alias jumps='dirs -v'
