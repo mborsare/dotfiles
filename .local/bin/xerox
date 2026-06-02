@@ -5,6 +5,8 @@ DEST_NAME="${XEROX_DEST:-prime}"
 DEST_HOST="${XEROX_DEST_HOST:-}"
 DEST_USER="${XEROX_DEST_USER:-mikeb}"
 DEST_DIR="${XEROX_DEST_DIR:-}"
+MOVE=0
+DRY_RUN=0
 
 usage() {
   cat >&2 <<'EOF_USAGE'
@@ -12,10 +14,16 @@ usage:
   xerox PATH
   xerox DEST PATH
   xerox --to DEST PATH
+  xerox --move DEST PATH
+  xerox --dry-run --move DEST PATH
 
 destinations:
   prime      copies to mikeb@192.168.50.53:~/Documents/Primetv/
   oldcloud   copies to mikeb@192.168.50.53:~/oldcloud/
+
+flags:
+  --move, -m     remove source files after successful transfer
+  --dry-run, -n  show what would happen
 
 env overrides:
   XEROX_DEST, XEROX_DEST_HOST, XEROX_DEST_USER, XEROX_DEST_DIR
@@ -27,6 +35,14 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
+      ;;
+    -m|--move)
+      MOVE=1
+      shift
+      ;;
+    -n|--dry-run)
+      DRY_RUN=1
+      shift
       ;;
     -t|--to)
       if [[ $# -lt 2 ]]; then
@@ -82,14 +98,32 @@ parent_dir=$(cd "$(dirname "$src")" && pwd -P)
 
 ssh "$DEST_USER@$DEST_HOST" "mkdir -p ~/'$DEST_DIR'"
 
+RSYNC_ARGS=(-avh --partial --partial-dir=.rsync-partial --info=progress2)
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  RSYNC_ARGS+=(-n --itemize-changes)
+fi
+
+if [[ "$MOVE" -eq 1 ]]; then
+  RSYNC_ARGS+=(--remove-source-files)
+fi
+
 if [[ -d "$src" ]]; then
-  printf 'Copying %s/%s -> %s@%s:~/%s/%s\n' \
+  printf 'Xeroxing %s/%s -> %s@%s:~/%s/%s\n' \
     "$parent_dir" "$name" "$DEST_USER" "$DEST_HOST" "$DEST_DIR" "$name"
-  rsync -avh --progress "$parent_dir/$name/" \
+
+  rsync "${RSYNC_ARGS[@]}" \
+    "$parent_dir/$name/" \
     "$DEST_USER@$DEST_HOST:~/$DEST_DIR/$name/"
+
+  if [[ "$MOVE" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
+    find "$parent_dir/$name" -depth -type d -empty -delete
+  fi
 else
-  printf 'Copying %s/%s -> %s@%s:~/%s/%s\n' \
+  printf 'Xeroxing %s/%s -> %s@%s:~/%s/%s\n' \
     "$parent_dir" "$name" "$DEST_USER" "$DEST_HOST" "$DEST_DIR" "$name"
-  rsync -avh --progress "$parent_dir/$name" \
+
+  rsync "${RSYNC_ARGS[@]}" \
+    "$parent_dir/$name" \
     "$DEST_USER@$DEST_HOST:~/$DEST_DIR/"
 fi

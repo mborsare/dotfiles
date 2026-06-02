@@ -125,11 +125,13 @@ alias nuke='rm -rf'
 alias nv='nvim'
 alias oil="$HOME/oil.sh"
 alias pip='python3 -m pip'
+alias primedrive='/Volumes/PRIME/'
 alias re='source ~/.zshrc'
 alias rename='mv'
 alias rithmic='wine "$HOME/.wine/drive_c/Program Files (x86)/Rithmic/Rithmic Trader Pro/Rithmic Trader Pro.exe"'
 alias scrap='${EDITOR:-nvim} -c "setlocal buftype=nofile bufhidden=wipe noswapfile"'
 alias stream='$HOME/stream.sh'
+alias x='exit'
 
 # OS-specific aliases.
 if [[ "$OSTYPE" == darwin* ]]; then

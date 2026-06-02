@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SITE="/srv/htmlsrv/mikeb.work"
+CADDYFILE="/etc/caddy/Caddyfile"
+URL="https://oldbook.work"
+
+echo "== oldbook.work deploy =="
+
+echo "Checking site dir..."
+test -d "$SITE"
+test -f "$SITE/index.html"
+
+echo "Validating Caddy..."
+sudo caddy fmt --overwrite "$CADDYFILE"
+sudo caddy validate --config "$CADDYFILE"
+
+echo "Restarting Caddy..."
+sudo systemctl restart caddy
+
+echo "Checking service..."
+systemctl is-active --quiet caddy
+
+echo "Testing public URL..."
+curl -I "$URL"
+
+echo
+echo "Deploy complete: $URL"
