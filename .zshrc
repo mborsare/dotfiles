@@ -16,13 +16,40 @@ if [[ "$OSTYPE" == darwin* ]]; then
   export AERC_CONFIG="$HOME/Library/Preferences/aerc"
 fi
 
-# Linux-only paths/config.
-if [[ "$OSTYPE" == linux* ]]; then
-  export AERC_CONFIG="$HOME/.config/aerc"
+# ── File Colors, No Dependencies ────────────────────────────────────────────
+export CLICOLOR=1
+
+# macOS/BSD ls uses LSCOLORS.
+# Linux/GNU ls uses LS_COLORS.
+if [[ "$OSTYPE" == darwin* ]]; then
+  # Pick a random bright ANSI color letter for directories/symlinks/executables.
+  # C = bright green, D = yellow, E = blue, F = magenta, G = cyan, H = white
+  lsc_pool=(C D E F G H)
+  LS_DIR_COL=${lsc_pool[$(( 1 + RANDOM % $#lsc_pool ))]}
+  LS_LINK_COL=${lsc_pool[$(( 1 + RANDOM % $#lsc_pool ))]}
+  LS_EXE_COL=${lsc_pool[$(( 1 + RANDOM % $#lsc_pool ))]}
+
+  # Order:
+  # dir link socket pipe exe block char suid sgid sticky writable-sticky writable
+  export LSCOLORS="${LS_DIR_COL}x${LS_LINK_COL}xFxDx${LS_EXE_COL}xEgEdxbxgxcxd"
+
+elif [[ "$OSTYPE" == linux* ]]; then
+  # Linux does use LS_COLORS.
+  file_pool=(31 32 33 34 35 36 37 91 92 93 94 95 96)
+  LS_DIR_COL=${file_pool[$(( 1 + RANDOM % $#file_pool ))]}
+  LS_LINK_COL=${file_pool[$(( 1 + RANDOM % $#file_pool ))]}
+  LS_EXE_COL=${file_pool[$(( 1 + RANDOM % $#file_pool ))]}
+  LS_FILE_COL=${file_pool[$(( 1 + RANDOM % $#file_pool ))]}
+
+  export LS_COLORS="di=1;${LS_DIR_COL}:ln=1;${LS_LINK_COL}:ex=1;${LS_EXE_COL}:*.txt=${LS_FILE_COL}:*.md=${LS_FILE_COL}:*.sh=1;${LS_EXE_COL}:*.db=${LS_FILE_COL}:*.toml=${LS_FILE_COL}:*.json=${LS_FILE_COL}:*.html=${LS_FILE_COL}"
 fi
 
 # ── Login banner ────────────────────────────────────────────────────────────
 if [[ -o interactive ]]; then
+  if [[ -x "$HOME/.config/alacritty/random-palette.zsh" ]]; then
+    "$HOME/.config/alacritty/random-palette.zsh"
+  fi
+
   clear
 
   # 1. Curated "Safe" Palette
@@ -137,9 +164,13 @@ alias x='exit'
 if [[ "$OSTYPE" == darwin* ]]; then
   alias br='brew'
   alias ls='ls -G'
+  alias ll='ls -lahG'
+  alias la='ls -laG'
   alias iplocal='ipconfig getifaddr en0'
 elif [[ "$OSTYPE" == linux* ]]; then
   alias ls='ls --color=auto'
+  alias ll='ls -lah --color=auto'
+  alias la='ls -la --color=auto'
   alias iplocal="hostname -I | awk '{print \$1}'"
 fi
 
@@ -150,14 +181,6 @@ venv() {
 }
 
 # ── Zsh Settings & Completion ────────────────────────────────────────────────
-export CLICOLOR=1
-export LSCOLORS=ExFxCxDxBxegedabagacad
-
-# Linux color support for completions.
-if [[ "$OSTYPE" == linux* ]] && command -v dircolors >/dev/null 2>&1; then
-  eval "$(dircolors -b)"
-fi
-
 autoload -Uz colors && colors
 autoload -Uz compinit
 
