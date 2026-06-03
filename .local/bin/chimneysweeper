@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_HOST="${CHIMNEYSWEEPER_HOST:-primebook.prime}"
+REMOTE_USER="${CHIMNEYSWEEPER_USER:-mikeb}"
+SSH_CONFIG="${CHIMNEYSWEEPER_SSH_CONFIG:-/dev/null}"
+REMOTE_DESKTOP="${CHIMNEYSWEEPER_DESKTOP:-Desktop}"
+DEST="${CHIMNEYSWEEPER_DEST:-$HOME/cloud/chimneysweeps}"
+DRY_RUN=0
+
+usage() {
+  cat >&2 <<'EOF_USAGE'
+usage:
+  chimneysweeper
+  chimneysweeper --dry-run
+
+env:
+  CHIMNEYSWEEPER_HOST       remote host to clean (default: primebook.prime)
+  CHIMNEYSWEEPER_USER       remote user (default: mikeb)
+  CHIMNEYSWEEPER_SSH_CONFIG ssh config for connecting to remote host (default: /dev/null)
+  CHIMNEYSWEEPER_DESKTOP    remote desktop path under $HOME (default: Desktop)
+  CHIMNEYSWEEPER_DEST       local destination (default: $HOME/cloud/chimneysweeps)
+EOF_USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+dest_real="$(readlink -m "$DEST")"
+case "$dest_real" in
+  /mnt/cloud|/mnt/cloud/*)
+    expected_dev="$(readlink -f /dev/disk/by-label/cloud 2>/dev/null || true)"
+    mounted_source="$(findmnt -rn --mountpoint /mnt/cloud -o SOURCE 2>/dev/null || true)"
+    mounted_dev="$(readlink -f "$mounted_source" 2>/dev/null || printf '%s' "$mounted_source")"
+    if [[ -z "$expected_dev" || "$mounted_dev" != "$expected_dev" ]]; then
+      cat >&2 <<EOF_DEST
+Refusing to run: CHIMNEYSWEEPER_DEST resolves under /mnt/cloud,
+but /mnt/cloud is not mounted from /dev/disk/by-label/cloud.
+
+Destination: $DEST
+Resolved:    $dest_real
+Mounted:     ${mounted_source:-none}
+Expected:    ${expected_dev:-/dev/disk/by-label/cloud}
+
+Mount cloud at /mnt/cloud first, or set CHIMNEYSWEEPER_DEST to a
+different staging path if you intentionally want to write to local storage.
+EOF_DEST
+      exit 1
+    fi
+    ;;
+esac
+
+mkdir -p "$DEST"
+
+remote_path="${REMOTE_DESKTOP%/}/"
+rsync_args=(
+  -avh
+  --ignore-existing
+  --partial
+  --partial-dir=.rsync-partial
+  --remove-source-files
+  --exclude=.DS_Store
+  --exclude=.localized
+  --exclude=desktop.ini
+  -e "ssh -F $SSH_CONFIG"
+)
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  rsync_args+=(-n --itemize-changes)
+fi
+
+rsync "${rsync_args[@]}" "$REMOTE_USER@$REMOTE_HOST:$remote_path" "$DEST/"
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  ssh -F "$SSH_CONFIG" "$REMOTE_USER@$REMOTE_HOST" \
+    "CHIMNEYSWEEPER_DESKTOP=$(printf '%q' "$REMOTE_DESKTOP") bash -s" <<'EOF_REMOTE'
+set -euo pipefail
+
+desktop="$HOME/${CHIMNEYSWEEPER_DESKTOP#/}"
+find "$desktop" -mindepth 1 -type d -empty -delete
+EOF_REMOTE
+fi

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEST_HOST="${CC_DEST_HOST:-primebook.prime}"
+DEST_USER="${CC_DEST_USER:-mikeb}"
+DEST_DIR="${CC_DEST_DIR:-Documents}"
+
+usage() {
+  printf 'usage: cc PATH\n' >&2
+  printf 'copies file or directory PATH to %s@%s:~/%s/\n' "$DEST_USER" "$DEST_HOST" "$DEST_DIR" >&2
+}
+
+if [[ $# -ne 1 ]]; then
+  usage
+  exit 2
+fi
+
+src=${1%/}
+
+if [[ ! -e "$src" ]]; then
+  printf 'cc: no such file or directory: %s\n' "$src" >&2
+  exit 1
+fi
+
+name=$(basename "$src")
+parent_dir=$(cd "$(dirname "$src")" && pwd -P)
+
+ssh "$DEST_USER@$DEST_HOST" "mkdir -p ~/'$DEST_DIR'"
+
+if [[ -d "$src" ]]; then
+  printf 'Copying %s/%s -> %s@%s:~/%s/%s\n' \
+    "$parent_dir" "$name" "$DEST_USER" "$DEST_HOST" "$DEST_DIR" "$name"
+  rsync -avh --progress "$parent_dir/$name/" \
+    "$DEST_USER@$DEST_HOST:~/$DEST_DIR/$name/"
+else
+  printf 'Copying %s/%s -> %s@%s:~/%s/%s\n' \
+    "$parent_dir" "$name" "$DEST_USER" "$DEST_HOST" "$DEST_DIR" "$name"
+  rsync -avh --progress "$parent_dir/$name" \
+    "$DEST_USER@$DEST_HOST:~/$DEST_DIR/"
+fi

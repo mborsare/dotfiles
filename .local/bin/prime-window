@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+windows="$(
+  swaymsg -t get_tree |
+    jq -r '
+      def nodes: recurse(.nodes[]?, .floating_nodes[]?);
+      nodes
+      | select(.type == "con" and .pid != null and .name != null)
+      | select(.app_id != null or .window_properties.class != null)
+      | [
+          .id,
+          (.app_id // .window_properties.class // "app"),
+          .name
+        ]
+      | @tsv
+    '
+)"
+
+if [[ -z "$windows" ]]; then
+  exit 0
+fi
+
+selection="$(
+  printf '%s\n' "$windows" |
+    awk -F '\t' '{ printf "%s\t%s - %s\n", $1, $2, $3 }' |
+    wofi --dmenu --prompt windows |
+    cut -f1
+)"
+
+if [[ -n "$selection" ]]; then
+  swaymsg "[con_id=$selection]" focus >/dev/null
+fi

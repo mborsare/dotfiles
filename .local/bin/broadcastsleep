@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SLEEP_FILE="/tmp/broadcast-sleep.txt"
+ROOT_HLS_DIR="/tmp/broadcast-hls"
+PORT="8090"
+BROADCAST_PATTERN='(^|[ /])broadcast([[:space:]]|$)'
+
+usage() {
+  echo "usage: broadcastsleep MINUTES" >&2
+  exit 2
+}
+
+[[ $# -eq 1 ]] || usage
+[[ "$1" =~ ^[0-9]+$ ]] || usage
+
+remaining=$(("$1" * 60))
+end_ms=$(( $(date +%s%3N) + remaining * 1000 ))
+
+format_remaining() {
+  local total_seconds="$1"
+  local days hours minutes seconds
+  local parts=()
+
+  days=$((total_seconds / 86400))
+  hours=$(((total_seconds % 86400) / 3600))
+  minutes=$(((total_seconds % 3600) / 60))
+  seconds=$((total_seconds % 60))
+
+  if (( days > 0 )); then
+    parts+=("${days}d")
+    parts+=("$(printf "%02dh" "$hours")")
+    parts+=("$(printf "%02dm" "$minutes")")
+    parts+=("$(printf "%02ds" "$seconds")")
+  elif (( hours > 0 )); then
+    parts+=("${hours}h")
+    parts+=("$(printf "%02dm" "$minutes")")
+    parts+=("$(printf "%02ds" "$seconds")")
+  elif (( minutes > 0 )); then
+    parts+=("${minutes}m")
+    parts+=("$(printf "%02ds" "$seconds")")
+  else
+    parts+=("${seconds}s")
+  fi
+
+  printf "%s" "${parts[*]}"
+}
+
+cleanup() {
+  : > "$SLEEP_FILE"
+}
+trap cleanup EXIT INT TERM
+
+stop_broadcast() {
+  local pids
+
+  pids="$(pgrep -f "$BROADCAST_PATTERN" 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    kill $pids 2>/dev/null || true
+  fi
+
+  pids="$(pgrep -f "$ROOT_HLS_DIR" 2>/dev/null || true)"
+  if [[ -n "$pids" ]]; then
+    kill -9 $pids 2>/dev/null || true
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -ti :"$PORT" 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      kill -9 $pids 2>/dev/null || true
+    fi
+  elif command -v fuser >/dev/null 2>&1; then
+    pids="$(fuser -n tcp "$PORT" 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      kill -9 $pids 2>/dev/null || true
+    fi
+  fi
+
+  rm -rf "$ROOT_HLS_DIR"
+}
+
+while true; do
+  now_ms="$(date +%s%3N)"
+  remaining_ms=$((end_ms - now_ms))
+  remaining_seconds=$(((remaining_ms + 999) / 1000))
+
+  if (( remaining_ms <= 0 )); then
+    break
+  fi
+
+  if (( remaining_ms <= 60000 )); then
+    printf "sleep %s\n" \
+      "$(format_remaining "$remaining_seconds")" \
+      > "$SLEEP_FILE"
+    sleep 0.05
+  else
+    remaining_minutes=$(((remaining_seconds + 59) / 60))
+    printf "sleep %s\n" \
+      "${remaining_minutes}m" \
+      > "$SLEEP_FILE"
+    sleep 1
+  fi
+done
+
+cleanup
+stop_broadcast
