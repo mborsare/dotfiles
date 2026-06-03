@@ -131,6 +131,7 @@ alias day="$HOME/day.sh"
 alias delete='rm -rv'
 alias docs='cd "$HOME/Documents"'
 alias dot='git --git-dir=$HOME/.dotfiles --work-tree=$HOME'
+alias drives='lsblk -f'
 alias edit='nvim'
 alias exe='$HOME/.local/bin/'
 alias ez='${EDITOR:-nvim} ~/.zshrc'
