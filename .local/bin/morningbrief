@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 # ─────────────────────────────────────────────────────────────
 # Morningbrief
 # oldbook does the work.
 # Finished assets go to ~/cloud, which is a symlink to the mount.
+#
+# Current mode:
+#   daily cartoon grab from ~/Documents/Will-broadcast
 # ─────────────────────────────────────────────────────────────
 
-TRIBUNE_URL="https://fun.chicagotribune.com/game/tca-jumble-daily"
-
-BROWSER="${BROWSER_BIN:-chromium}"
 WILL="$HOME/Documents/Will-broadcast"
 CLOUD="$HOME/cloud"
 
@@ -17,17 +17,17 @@ TODAY="$(date +%F)"
 OUTROOT="$CLOUD/morningbrief"
 OUT="$OUTROOT/$TODAY"
 LATEST="$OUTROOT/latest"
+LOGROOT="$OUTROOT/logs"
+LOG="$LOGROOT/morningbrief-$TODAY.log"
 
-# Screenshot size for the direct Jumble game.
-SHOT_W="${SHOT_W:-980}"
-SHOT_H="${SHOT_H:-1420}"
+CARTOON_OUT="$OUT/cartoon-$TODAY.jpg"
 
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
 
 die() {
-  echo "morningbrief: $*" >&2
+  echo "morningbrief: ERROR: $*" >&2
   exit 1
 }
 
@@ -35,15 +35,18 @@ need() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
 
+on_error() {
+  local line=$1
+  local code=$2
+  echo "morningbrief: ERROR on line $line, exit $code" >&2
+}
+
+trap 'on_error "$LINENO" "$?"' ERR
+
 # ─────────────────────────────────────────────────────────────
 # Checks
 # ─────────────────────────────────────────────────────────────
 
-need "$BROWSER"
-need curl
-need grep
-need sed
-need head
 need magick
 need ffmpeg
 need ffprobe
@@ -52,46 +55,35 @@ need awk
 need cp
 need rm
 need mkdir
+need find
+need tee
+need hostname
 
 [[ -e "$CLOUD" ]] || die "$CLOUD does not exist"
 [[ -d "$CLOUD" ]] || die "$CLOUD is not a directory"
 [[ -w "$CLOUD" ]] || die "$CLOUD is not writable"
 [[ -d "$WILL" ]] || die "missing Will-broadcast dir: $WILL"
 
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$LOGROOT"
+
+# Send all output to terminal AND log file.
+exec > >(tee -a "$LOG") 2>&1
+
+echo "────────────────────────────────────────"
+echo "morningbrief start: $(date)"
+echo "host: $(hostname)"
+echo "user: $USER"
+echo "cloud: $CLOUD"
+echo "out: $OUT"
+echo "log: $LOG"
+echo "source dir: $WILL"
+echo "────────────────────────────────────────"
 
 # ─────────────────────────────────────────────────────────────
-# Capture Jumble directly
+# Grab daily cartoon still
 # ─────────────────────────────────────────────────────────────
 
-GAME_URL="$(
-  curl -fsSL "$TRIBUNE_URL" |
-    grep -o 'https://html5\.gamedistribution\.com/[^"]*' |
-    head -1 |
-    sed 's/\\u0026/\&/g'
-)"
-
-[[ -n "$GAME_URL" ]] || die "could not find direct Jumble game URL"
-
-JUMBLE_OUT="$OUT/jumble-$TODAY.png"
-
-"$BROWSER" \
-  --headless=new \
-  --disable-gpu \
-  --no-first-run \
-  --no-default-browser-check \
-  --hide-scrollbars \
-  --window-size="$SHOT_W,$SHOT_H" \
-  --virtual-time-budget=15000 \
-  --screenshot="$JUMBLE_OUT" \
-  "$GAME_URL" \
-  >/dev/null 2>&1 || die "Jumble screenshot failed"
-
-printf '%s\n' "$GAME_URL" > "$OUT/jumble-url-$TODAY.txt"
-
-# ─────────────────────────────────────────────────────────────
-# Grab random Will-broadcast still
-# ─────────────────────────────────────────────────────────────
+echo "finding random cartoon/media..."
 
 SRC="$(
   find "$WILL" -type f \( \
@@ -104,20 +96,21 @@ SRC="$(
     -iname '*.mov'  -o \
     -iname '*.mkv'  -o \
     -iname '*.webm' -o \
-    -iname '*.m4v' \
+    -iname '*.m4v'  -o \
+    -iname '*.avi' \
   \) | shuf -n 1
 )"
 
 [[ -n "$SRC" ]] || die "no media found in $WILL"
 
-WILL_OUT="$OUT/will-random-$TODAY.jpg"
+echo "source: $SRC"
 
 case "${SRC,,}" in
   *.jpg|*.jpeg|*.png|*.webp|*.gif)
     magick "$SRC" \
       -auto-orient \
       -resize '1600x1600>' \
-      "$WILL_OUT"
+      "$CARTOON_OUT"
     ;;
 
   *)
@@ -136,34 +129,44 @@ case "${SRC,,}" in
       }'
     )"
 
+    echo "video duration: $DUR"
+    echo "grab second: $SS"
+
     ffmpeg -hide_banner -loglevel error -y \
       -ss "$SS" \
       -i "$SRC" \
       -frames:v 1 \
       -q:v 2 \
-      "$WILL_OUT"
+      "$CARTOON_OUT"
     ;;
 esac
 
-printf '%s\n' "$SRC" > "$OUT/will-source-$TODAY.txt"
+[[ -s "$CARTOON_OUT" ]] || die "cartoon grab missing or empty: $CARTOON_OUT"
+
+printf '%s\n' "$SRC" > "$OUT/cartoon-source-$TODAY.txt"
+
+echo "cartoon saved: $CARTOON_OUT"
 
 # ─────────────────────────────────────────────────────────────
 # Latest folder
 # ─────────────────────────────────────────────────────────────
 
-# Make latest a real folder, not a symlink.
-# This keeps it friendly across mounts, SMB, Finder, rsync, etc.
+echo "updating latest..."
+
 rm -rf "$LATEST"
 mkdir -p "$LATEST"
 cp -f "$OUT"/* "$LATEST"/
+cp -f "$LOG" "$LATEST/latest.log" 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────
 # Done
 # ─────────────────────────────────────────────────────────────
 
+echo "────────────────────────────────────────"
+echo "morningbrief done: $(date)"
 echo "saved:        $OUT"
 echo "latest:       $LATEST"
-echo "jumble:       $JUMBLE_OUT"
-echo "jumble url:   $GAME_URL"
-echo "will shot:    $WILL_OUT"
-echo "will source:  $SRC"
+echo "cartoon:      $CARTOON_OUT"
+echo "source:       $SRC"
+echo "log:          $LOG"
+echo "────────────────────────────────────────"
