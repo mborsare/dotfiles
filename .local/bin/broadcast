@@ -4,7 +4,8 @@ set -euo pipefail
 # --- Configuration ---
 PORT="${PORT:-8090}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
-ROOT_HLS_DIR="${ROOT_HLS_DIR:-/tmp/broadcast-hls}"
+# Moved from /tmp to /var/tmp for long-term storage safety (prevents system auto-clean deletion)
+ROOT_HLS_DIR="${ROOT_HLS_DIR:-/var/tmp/broadcast-hls}"
 FFMPEG="${FFMPEG:-ffmpeg}"
 FFPROBE="${FFPROBE:-ffprobe}"
 LOGO_PATH="${LOGO_PATH:-$HOME/Documents/Prime/logotype.png}"
@@ -28,19 +29,18 @@ QUOTE_REFRESH_SECONDS="${QUOTE_REFRESH_SECONDS:-15}"
 DEFAULT_SCROLL_TEXT="${DEFAULT_SCROLL_TEXT:-Welcome our special guest AEDAN!. Hi Aedan}"
 SCROLL_SPEED="${SCROLL_SPEED:-95}"
 
-AD_REQUEST_FILE="${AD_REQUEST_FILE:-/tmp/broadcast-ad-request.txt}"
-AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
-
+# --- Internal File Tracking ---
 SERVER_PID=""
 CHANNELS=()
 
-# --- RAM-Disk Strategy for 7-Day Performance ---
-# Use shared memory (/dev/shm) if available to eliminate disk I/O strain over 168 hours.
+# Route high-frequency text changes to RAM disk if available, protecting SSD longevity
 SHM_DIR="/tmp"
 if [[ -d "/dev/shm" && -w "/dev/shm" ]]; then
   SHM_DIR="/dev/shm"
 fi
 
+AD_REQUEST_FILE="$SHM_DIR/broadcast-ad-request.txt"
+AD_NOW_FILE="$SHM_DIR/broadcast-ad-now.txt"
 CLOCK_FILE="$SHM_DIR/broadcast-clock-$$.txt"
 QUOTE_FILE="$SHM_DIR/broadcast-quotes-$$.txt"
 SCROLL_FILE="$SHM_DIR/broadcast-scroll-$$.txt"
@@ -176,7 +176,7 @@ cleanup() {
   rm -rf "$ROOT_HLS_DIR"
 
   rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
-  rm -f "$AD_NOW_FILE"
+  rm -f "$AD_NOW_FILE" "$AD_REQUEST_FILE"
 
   echo "[+] Broadcast stopped cleanly."
   exit 0
@@ -185,7 +185,7 @@ trap cleanup EXIT INT TERM
 
 start_server() {
   echo "[*] Starting Web Server on $BIND_ADDR:$PORT..."
-  BIND_ADDR="$BIND_ADDR" PORT="$PORT" ROOT_HLS_DIR="$ROOT_HLS_DIR" python3 - >/tmp/broadcast-server.log 2>&1 <<'PY' &
+  BIND_ADDR="$BIND_ADDR" PORT="$PORT" ROOT_HLS_DIR="$ROOT_HLS_DIR" python3 - >/var/tmp/broadcast-server.log 2>&1 <<'PY' &
 import http.server
 import os
 
@@ -231,7 +231,7 @@ wait_for_server() {
 
     if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
       echo "[error] Web server exited before it was reachable." >&2
-      cat /tmp/broadcast-server.log >&2 2>/dev/null || true
+      cat /var/tmp/broadcast-server.log >&2 2>/dev/null || true
       exit 1
     fi
 
@@ -239,7 +239,7 @@ wait_for_server() {
   done
 
   echo "[error] Web server did not become reachable at $url" >&2
-  cat /tmp/broadcast-server.log >&2 2>/dev/null || true
+  cat /var/tmp/broadcast-server.log >&2 2>/dev/null || true
   exit 1
 }
 
@@ -588,7 +588,7 @@ run_ffmpeg_hls() {
     loop_args=(-stream_loop -1)
   fi
 
-  # Optimized flags targeting deep 7-day runtime loops 
+  # Configured with loop-strengthening re-connect flags to survive 168 hours safely
   "$FFMPEG" -nostdin -hide_banner -loglevel warning \
     -re \
     "${loop_args[@]}" \
@@ -686,7 +686,7 @@ rm -rf "$ROOT_HLS_DIR"
 mkdir -p "$ROOT_HLS_DIR"
 
 rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
-rm -f "$AD_NOW_FILE"
+rm -f "$AD_NOW_FILE" "$AD_REQUEST_FILE"
 
 printf -- "--:--:--\n" > "$CLOCK_FILE"
 printf "RTY -----\nNQ  -----\n" > "$QUOTE_FILE"
@@ -743,7 +743,7 @@ done
 echo "Ad trigger:"
 echo "./$(basename "$0") ad 45 /path/to/foo.mp4"
 echo ""
-echo "Press Ctrl+C to stop or it will self-terminate in exactly 7 days."
+echo "Press Ctrl+C to stop or let it run. It will auto-terminate in exactly 7 days."
 
-# Enforce a hard timeout ceiling for exactly 7 days (604,800 seconds)
+# Enforce 7-day runtime duration cap (604800 seconds)
 timeout 604800 wait || cleanup
