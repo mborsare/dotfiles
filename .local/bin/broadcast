@@ -6,8 +6,10 @@ PORT="8090"
 BIND_ADDR="127.0.0.1"
 ROOT_HLS_DIR="/tmp/broadcast-hls"
 FFMPEG="ffmpeg"
+FFPROBE="ffprobe"
 LOGO_PATH="$HOME/Documents/Prime/logotype.png"
 SERVER_PID=""
+
 
 CLOCK_FILE="/tmp/broadcast-clocks-$$.txt"
 NQ_NOW_FILE="/tmp/broadcast-nq-now-$$.txt"
@@ -15,6 +17,13 @@ HEADLINE_FILE="/tmp/broadcast-headlines-$$.txt"
 SLEEP_FILE="/tmp/broadcast-sleep.txt"
 
 NQ_NOW_URL="https://weather.mborsare.workers.dev/prime/weather/NQ"
+
+HEADLINE_SOURCES=(
+  "NYT|https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
+  "WAPO|https://feeds.washingtonpost.com/rss/homepage"
+  "BBC|https://feeds.bbci.co.uk/news/rss.xml"
+  "AP|https://feeds.apnews.com/rss/apf-topnews"
+)
 
 OUTPUT_FPS="24"
 VIDEO_BITRATE="1600k"
@@ -26,7 +35,7 @@ HLS_TIME="1"
 HLS_LIST_SIZE="6"
 HLS_DELETE_THRESHOLD="3"
 
-DEFAULT_MEDIA_DIR="$HOME/Documents/Primetv"
+DEFAULT_MEDIA_DIR="$HOME/Documents/Will-broadcast/"
 DEFAULT_SIZE="960:540"
 
 CHANNELS=()
@@ -71,7 +80,7 @@ require_runtime() {
   local missing=()
   local cmd
 
-  for cmd in "$FFMPEG" python3 curl; do
+  for cmd in "$FFMPEG" "$FFPROBE" python3 curl; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
     fi
@@ -226,35 +235,89 @@ except Exception:
 }
 
 fetch_headline() {
-  local feed="https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
-  local encoded
-
-  encoded="$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$feed")"
-
-  curl -sf --max-time 5 "https://api.rss2json.com/v1/api.json?rss_url=$encoded" \
-    | python3 -c "
-import json
-import sys
+  python3 - "${HEADLINE_SOURCES[@]}" <<'PY'
 import random
+import re
+import sys
+import urllib.request
+import xml.etree.ElementTree as ET
+from html import unescape
 
-try:
-    data = json.load(sys.stdin)
-    items = data.get('items', [])[:10]
+LIMIT_PER_SOURCE = 8
+PICKS = 5
 
-    if items:
-        picks = [i.get('title', '') for i in random.sample(items, min(5, len(items)))]
-        picks = [p for p in picks if p]
-        print('   //   '.join(picks))
-except Exception:
-    pass
-" 2>/dev/null || true
+items = []
+seen = set()
+
+def clean(s):
+    s = unescape(s or "")
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"[\r\n\t]+", " ", s)
+    s = re.sub(r"[\\'%\[\]=]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:180]
+
+for raw in sys.argv[1:]:
+    try:
+        label, feed = raw.split("|", 1)
+
+        req = urllib.request.Request(
+            feed,
+            headers={
+                "User-Agent": "Mozilla/5.0 PrimeBroadcast/1.0",
+                "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            },
+        )
+
+        with urllib.request.urlopen(req, timeout=4) as response:
+            body = response.read()
+
+        root = ET.fromstring(body)
+
+        found = []
+
+        # RSS: channel/item/title
+        for item in root.findall(".//item"):
+            title_el = item.find("title")
+            if title_el is not None and title_el.text:
+                found.append(title_el.text)
+
+        # Atom fallback: entry/title
+        if not found:
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            for entry in root.findall(".//atom:entry", ns):
+                title_el = entry.find("atom:title", ns)
+                if title_el is not None and title_el.text:
+                    found.append(title_el.text)
+
+        for title in found[:LIMIT_PER_SOURCE]:
+            title = clean(title)
+            if not title:
+                continue
+
+            key = title.lower()
+            if key in seen:
+                continue
+
+            seen.add(key)
+            items.append(f"{label}: {title}")
+
+    except Exception:
+        continue
+
+if items:
+    random.shuffle(items)
+    print("   //   ".join(items[:PICKS]))
+else:
+    print("PRIME BROADCAST")
+PY
 }
 
 start_headline_file() {
   (
     while [[ ! -f "$STOP_FILE" ]]; do
       local headline
-      headline="$(fetch_headline | tr "'\\%[]=" "      ")"
+      headline="$(fetch_headline)"
 
       if [[ -z "$headline" ]]; then
         headline="PRIME BROADCAST"
@@ -299,31 +362,66 @@ write_concat_playlist() {
   local media_path="$1"
   local playlist_ffconcat="$2"
 
-  python3 - "$media_path" "$playlist_ffconcat" <<'PY'
+  python3 - "$media_path" "$playlist_ffconcat" "$FFPROBE" <<'PY'
 import random
+import subprocess
 import sys
 from pathlib import Path
 
 media_path = Path(sys.argv[1]).expanduser()
 playlist = Path(sys.argv[2])
+ffprobe = sys.argv[3]
 
-exts = {".mp4", ".mkv", ".mov", ".m4v"}
+exts = {".mp4", ".mkv", ".mov", ".m4v", ".webm"}
+
+def has_video(path):
+    try:
+        r = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_type",
+                "-of", "csv=p=0",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+        return r.returncode == 0 and "video" in r.stdout
+    except Exception:
+        return False
 
 if media_path.is_file():
-    files = [media_path.resolve()]
+    candidates = [media_path.resolve()]
 elif media_path.is_dir():
-    files = [
+    candidates = [
         p.resolve()
         for p in media_path.rglob("*")
         if p.is_file() and p.suffix.lower() in exts
     ]
-    files.sort(key=lambda p: str(p).lower())
-    random.shuffle(files)
 else:
     raise SystemExit(f"No such file or folder: {media_path}")
 
-if not files:
-    raise SystemExit(f"No media files found in {media_path}")
+good = []
+bad = []
+
+for path in candidates:
+    if has_video(path):
+        good.append(path)
+    else:
+        bad.append(path)
+
+good.sort(key=lambda p: str(p).lower())
+random.shuffle(good)
+
+for path in bad:
+    print(f"[skip bad media] {path}", file=sys.stderr)
+
+if not good:
+    raise SystemExit(f"No playable media files found in {media_path}")
 
 def ffconcat_quote(path: Path) -> str:
     s = str(path)
@@ -331,7 +429,7 @@ def ffconcat_quote(path: Path) -> str:
 
 with playlist.open("w", encoding="utf-8") as f:
     f.write("ffconcat version 1.0\n")
-    for path in files:
+    for path in good:
         f.write(f"file {ffconcat_quote(path)}\n")
 PY
 }
@@ -497,9 +595,20 @@ echo "[*] Initializing streams..."
 
 for channel in "${CHANNELS[@]}"; do
   IFS='|' read -r name _ _ _ <<< "$channel"
-  until [[ -f "$ROOT_HLS_DIR/$name/index.m3u8" ]]; do
-    sleep 0.5
-  done
+  ready=0
+
+for _ in {1..120}; do
+  if [[ -f "$ROOT_HLS_DIR/$name/index.m3u8" ]]; then
+    ready=1
+    break
+  fi
+  sleep 0.5
+done
+
+if [[ "$ready" -ne 1 ]]; then
+  echo "[error] $name never produced index.m3u8" >&2
+  exit 1
+fi
 done
 
 echo -e "\n\033[1;32m------------------------------------------------\033[0m"
@@ -519,3 +628,5 @@ done
 
 echo "Press Ctrl+C to stop."
 wait
+
+
