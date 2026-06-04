@@ -28,9 +28,14 @@ examples:
   xerox ~/videos/vacation.mp4
   xerox --dry-run ~/data
   xerox --move /large/dataset
+  xerox --to primebook ~/Pictures/screenshot.png
+  xerox --to morningbrief ~/Pictures/morningbrief/2026-06-04
 
 destinations:
-  cloud   copies to mikeb@192.168.50.53:~/cloud/ (symlink to mount)
+  cloud         copies to mikeb@oldbook.prime:~/cloud/ (symlink to mount)
+  oldbook       copies to mikeb@oldbook.prime:~/incoming/
+  primebook     copies to mikeb@primebook.prime:~/incoming/
+  morningbrief  copies to mikeb@primebook.prime:~/cloud/morningbrief/
 USAGE
 }
 
@@ -46,13 +51,37 @@ log() {
 # Resolve destination config
 resolve_destination() {
   local dest=$1
-  
+
   case "$dest" in
     cloud)
-      DEST_HOST="192.168.50.53"
+      # One canonical cloud drop.
+      # ~/cloud on oldbook is a symlink to the mount.
+      DEST_HOST="oldbook.prime"
       DEST_USER="mikeb"
       DEST_DIR="cloud"
       ;;
+
+    oldbook)
+      # The oldbook machine itself.
+      DEST_HOST="oldbook.prime"
+      DEST_USER="mikeb"
+      DEST_DIR="incoming"
+      ;;
+
+    primebook)
+      # The primebook machine itself.
+      DEST_HOST="primebook.prime"
+      DEST_USER="mikeb"
+      DEST_DIR="incoming"
+      ;;
+
+    morningbrief)
+      # Morning assets are made on oldbook and pushed to primebook.
+      DEST_HOST="primebook.prime"
+      DEST_USER="mikeb"
+      DEST_DIR="cloud/morningbrief"
+      ;;
+
     *)
       error "unknown destination: $dest"
       ;;
@@ -66,7 +95,7 @@ do_rsync() {
   local is_dir=$3
 
   local args=(-avh --partial --partial-dir=.rsync-partial --info=progress2)
-  
+
   [[ $DRY_RUN -eq 1 ]] && args+=(-n --itemize-changes)
   [[ $MOVE -eq 1 ]] && args+=(--remove-source-files)
 
@@ -90,29 +119,37 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
+
     -l|--list)
-      printf '%s\n' "cloud"
+      printf '%s\n' "cloud" "oldbook" "primebook" "morningbrief"
       exit 0
       ;;
+
     -m|--move)
       MOVE=1
       shift
       ;;
+
     -n|--dry-run)
       DRY_RUN=1
       shift
       ;;
+
     -t|--to)
+      [[ $# -ge 2 ]] || error "--to requires a destination"
       DEST_NAME="$2"
       shift 2
       ;;
+
     --to=*)
       DEST_NAME="${1#--to=}"
       shift
       ;;
+
     -*)
       error "unknown option: $1"
       ;;
+
     *)
       break
       ;;
@@ -151,10 +188,11 @@ log "Xeroxing $parent_dir/$name -> $DEST_USER@$DEST_HOST:~/$DEST_DIR/$name"
 
 # Do the copy
 remote="$DEST_USER@$DEST_HOST:~/$DEST_DIR"
+
 if [[ "$is_dir" == "true" ]]; then
   do_rsync "$parent_dir/$name" "$remote/$name" true || \
     error "rsync failed"
-  
+
   # Clean up empty dirs after move
   if [[ $MOVE -eq 1 && $DRY_RUN -eq 0 ]]; then
     find "$parent_dir/$name" -depth -type d -empty -delete
