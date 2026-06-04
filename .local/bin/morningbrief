@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────
+# Morningbrief
+# oldbook does the work.
+# Finished assets go to ~/cloud, which is a symlink to the mount.
+# ─────────────────────────────────────────────────────────────
+
+TRIBUNE_URL="https://fun.chicagotribune.com/game/tca-jumble-daily"
+
+BROWSER="${BROWSER_BIN:-chromium}"
+WILL="$HOME/Documents/Will-broadcast"
+CLOUD="$HOME/cloud"
+
+TODAY="$(date +%F)"
+OUTROOT="$CLOUD/morningbrief"
+OUT="$OUTROOT/$TODAY"
+LATEST="$OUTROOT/latest"
+
+# Screenshot size for the direct Jumble game.
+SHOT_W="${SHOT_W:-980}"
+SHOT_H="${SHOT_H:-1420}"
+
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
+
+die() {
+  echo "morningbrief: $*" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Checks
+# ─────────────────────────────────────────────────────────────
+
+need "$BROWSER"
+need curl
+need grep
+need sed
+need head
+need magick
+need ffmpeg
+need ffprobe
+need shuf
+need awk
+need cp
+need rm
+need mkdir
+
+[[ -e "$CLOUD" ]] || die "$CLOUD does not exist"
+[[ -d "$CLOUD" ]] || die "$CLOUD is not a directory"
+[[ -w "$CLOUD" ]] || die "$CLOUD is not writable"
+[[ -d "$WILL" ]] || die "missing Will-broadcast dir: $WILL"
+
+mkdir -p "$OUT"
+
+# ─────────────────────────────────────────────────────────────
+# Capture Jumble directly
+# ─────────────────────────────────────────────────────────────
+
+GAME_URL="$(
+  curl -fsSL "$TRIBUNE_URL" |
+    grep -o 'https://html5\.gamedistribution\.com/[^"]*' |
+    head -1 |
+    sed 's/\\u0026/\&/g'
+)"
+
+[[ -n "$GAME_URL" ]] || die "could not find direct Jumble game URL"
+
+JUMBLE_OUT="$OUT/jumble-$TODAY.png"
+
+"$BROWSER" \
+  --headless=new \
+  --disable-gpu \
+  --no-first-run \
+  --no-default-browser-check \
+  --hide-scrollbars \
+  --window-size="$SHOT_W,$SHOT_H" \
+  --virtual-time-budget=15000 \
+  --screenshot="$JUMBLE_OUT" \
+  "$GAME_URL" \
+  >/dev/null 2>&1 || die "Jumble screenshot failed"
+
+printf '%s\n' "$GAME_URL" > "$OUT/jumble-url-$TODAY.txt"
+
+# ─────────────────────────────────────────────────────────────
+# Grab random Will-broadcast still
+# ─────────────────────────────────────────────────────────────
+
+SRC="$(
+  find "$WILL" -type f \( \
+    -iname '*.jpg'  -o \
+    -iname '*.jpeg' -o \
+    -iname '*.png'  -o \
+    -iname '*.webp' -o \
+    -iname '*.gif'  -o \
+    -iname '*.mp4'  -o \
+    -iname '*.mov'  -o \
+    -iname '*.mkv'  -o \
+    -iname '*.webm' -o \
+    -iname '*.m4v' \
+  \) | shuf -n 1
+)"
+
+[[ -n "$SRC" ]] || die "no media found in $WILL"
+
+WILL_OUT="$OUT/will-random-$TODAY.jpg"
+
+case "${SRC,,}" in
+  *.jpg|*.jpeg|*.png|*.webp|*.gif)
+    magick "$SRC" \
+      -auto-orient \
+      -resize '1600x1600>' \
+      "$WILL_OUT"
+    ;;
+
+  *)
+    DUR="$(
+      ffprobe -v error \
+        -show_entries format=duration \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$SRC" 2>/dev/null || echo 5
+    )"
+
+    SS="$(
+      awk -v d="$DUR" 'BEGIN {
+        srand();
+        if (d <= 2) printf "0";
+        else printf "%.2f", (d * 0.10) + rand() * (d * 0.80);
+      }'
+    )"
+
+    ffmpeg -hide_banner -loglevel error -y \
+      -ss "$SS" \
+      -i "$SRC" \
+      -frames:v 1 \
+      -q:v 2 \
+      "$WILL_OUT"
+    ;;
+esac
+
+printf '%s\n' "$SRC" > "$OUT/will-source-$TODAY.txt"
+
+# ─────────────────────────────────────────────────────────────
+# Latest folder
+# ─────────────────────────────────────────────────────────────
+
+# Make latest a real folder, not a symlink.
+# This keeps it friendly across mounts, SMB, Finder, rsync, etc.
+rm -rf "$LATEST"
+mkdir -p "$LATEST"
+cp -f "$OUT"/* "$LATEST"/
+
+# ─────────────────────────────────────────────────────────────
+# Done
+# ─────────────────────────────────────────────────────────────
+
+echo "saved:        $OUT"
+echo "latest:       $LATEST"
+echo "jumble:       $JUMBLE_OUT"
+echo "jumble url:   $GAME_URL"
+echo "will shot:    $WILL_OUT"
+echo "will source:  $SRC"
