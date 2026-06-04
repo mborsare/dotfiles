@@ -44,6 +44,15 @@ elif [[ "$OSTYPE" == linux* ]]; then
   export LS_COLORS="di=1;${LS_DIR_COL}:ln=1;${LS_LINK_COL}:ex=1;${LS_EXE_COL}:*.txt=${LS_FILE_COL}:*.md=${LS_FILE_COL}:*.sh=1;${LS_EXE_COL}:*.db=${LS_FILE_COL}:*.toml=${LS_FILE_COL}:*.json=${LS_FILE_COL}:*.html=${LS_FILE_COL}"
 fi
 
+# ── Tmux Auto-Attach ─────────────────────────────────────────────────────────
+if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
+  if tmux has-session -t main 2>/dev/null; then
+    exec tmux attach -t main
+  else
+    exec tmux new-session -s main -n Zsh
+  fi
+fi
+
 # ── Login banner ────────────────────────────────────────────────────────────
 if [[ -o interactive ]]; then
   if [[ -x "$HOME/.config/alacritty/random-palette.zsh" ]]; then
@@ -216,11 +225,4 @@ battery_pct() {
 
 PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~ %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
 
-# ── Tmux Auto-Attach ─────────────────────────────────────────────────────────
-if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
-  if tmux has-session -t main 2>/dev/null; then
-    exec tmux attach -t main
-  else
-    exec tmux new-session -s main -n Zsh
-  fi
-fi
+
