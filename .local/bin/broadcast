@@ -25,8 +25,11 @@ DEFAULT_SIZE="${DEFAULT_SIZE:-960:540}"
 QUOTE_BASE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
 QUOTE_REFRESH_SECONDS="${QUOTE_REFRESH_SECONDS:-15}"
 
-SCROLL_TEXT="${SCROLL_TEXT:-Welcome our special guest AEDAN!. Hi Aedan}"
+DEFAULT_SCROLL_TEXT="${DEFAULT_SCROLL_TEXT:-Welcome our special guest AEDAN!. Hi Aedan}"
 SCROLL_SPEED="${SCROLL_SPEED:-95}"
+
+AD_REQUEST_FILE="${AD_REQUEST_FILE:-/tmp/broadcast-ad-request.txt}"
+AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
 
 SERVER_PID=""
 CHANNELS=()
@@ -35,6 +38,61 @@ CLOCK_FILE="/tmp/broadcast-clock-$$.txt"
 QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
 SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
 STOP_FILE="/tmp/broadcast-stop-$$"
+
+# --- Ad trigger mode ---
+# Usage:
+#   ./broadcast ad 45 foo.mp4
+#   broadcastad 45 foo.mp4
+run_ad_command=0
+
+if [[ "$(basename "$0")" == "broadcastad" ]]; then
+  run_ad_command=1
+fi
+
+if [[ "${1:-}" == "ad" ]]; then
+  run_ad_command=1
+  shift
+fi
+
+if [[ "$run_ad_command" -eq 1 ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "usage: broadcast ad SECONDS FILE" >&2
+    echo "   or: broadcastad SECONDS FILE" >&2
+    exit 1
+  fi
+
+  delay="$1"
+  ad_file="$2"
+
+  if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
+    echo "Delay must be seconds, like: 45" >&2
+    exit 1
+  fi
+
+  ad_path="$(
+    python3 - "$ad_file" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1]).expanduser()
+
+try:
+    print(str(p.resolve(strict=True)))
+except FileNotFoundError:
+    raise SystemExit(2)
+PY
+  )" || {
+    echo "No such ad file: $ad_file" >&2
+    exit 1
+  }
+
+  tmp="${AD_REQUEST_FILE}.$$"
+  printf "%s\t%s\n" "$delay" "$ad_path" > "$tmp"
+  mv "$tmp" "$AD_REQUEST_FILE"
+
+  echo "Ad queued: break in ${delay}s -> $ad_path"
+  exit 0
+fi
 
 if [[ $# -gt 0 ]]; then
   n=1
@@ -68,6 +126,10 @@ kill_port_listeners() {
   if [[ -n "$pids" ]]; then
     kill -9 $pids 2>/dev/null || true
   fi
+}
+
+kill_encoders() {
+  pkill -f "$ROOT_HLS_DIR" 2>/dev/null || true
 }
 
 require_runtime() {
@@ -106,10 +168,11 @@ cleanup() {
     kill $pids 2>/dev/null || true
   fi
 
-  pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
+  kill_encoders
   rm -rf "$ROOT_HLS_DIR"
 
   rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
+  rm -f "$AD_NOW_FILE"
 
   echo "[+] Broadcast stopped."
   exit 0
@@ -259,6 +322,57 @@ start_quote_file() {
   ) &
 }
 
+start_ad_watcher() {
+  (
+    while [[ ! -f "$STOP_FILE" ]]; do
+      if [[ -f "$AD_NOW_FILE" ]]; then
+        sleep 1
+        continue
+      fi
+
+      if [[ ! -s "$AD_REQUEST_FILE" ]]; then
+        sleep 1
+        continue
+      fi
+
+      local delay=""
+      local ad_path=""
+
+      IFS=$'\t' read -r delay ad_path < "$AD_REQUEST_FILE" || true
+      rm -f "$AD_REQUEST_FILE"
+
+      if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
+        delay="0"
+      fi
+
+      if [[ -z "$ad_path" || ! -f "$ad_path" ]]; then
+        printf "%s\n" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
+        continue
+      fi
+
+      local remaining="$delay"
+
+      while [[ "$remaining" -gt 0 && ! -f "$STOP_FILE" ]]; do
+        printf "COMMERCIAL BREAK IN %s  //  %s\n" "$remaining" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
+        sleep 1
+        remaining=$((remaining - 1))
+      done
+
+      if [[ -f "$STOP_FILE" ]]; then
+        break
+      fi
+
+      printf "%s\n" "$ad_path" > "$AD_NOW_FILE"
+      printf "COMMERCIAL BREAK\n" > "$SCROLL_FILE"
+
+      echo -e "\033[0;35m[ad]\033[0m Starting commercial: $ad_path"
+
+      kill_encoders
+      sleep 1
+    done
+  ) &
+}
+
 write_channel_manifest() {
   local manifest="$ROOT_HLS_DIR/channels.json"
 
@@ -359,6 +473,30 @@ with playlist.open("w", encoding="utf-8") as f:
 PY
 }
 
+write_single_file_playlist() {
+  local media_file="$1"
+  local playlist_ffconcat="$2"
+
+  python3 - "$media_file" "$playlist_ffconcat" <<'PY'
+import sys
+from pathlib import Path
+
+media_file = Path(sys.argv[1]).expanduser().resolve()
+playlist = Path(sys.argv[2])
+
+if not media_file.is_file():
+    raise SystemExit(f"No such media file: {media_file}")
+
+def ffconcat_quote(path: Path) -> str:
+    s = str(path)
+    return "'" + s.replace("'", "'\\''") + "'"
+
+with playlist.open("w", encoding="utf-8") as f:
+    f.write("ffconcat version 1.0\n")
+    f.write(f"file {ffconcat_quote(media_file)}\n")
+PY
+}
+
 build_video_filter() {
   local width="$1"
   local height="$2"
@@ -377,8 +515,6 @@ build_video_filter() {
   if [[ -f "$font_path" ]]; then
     font_arg="fontfile='$font_path':"
   fi
-
-  printf "%s\n" "$SCROLL_TEXT" > "$SCROLL_FILE"
 
   v_filter="fps=$OUTPUT_FPS,"
   v_filter+="setsar=1,"
@@ -406,7 +542,7 @@ build_video_filter() {
   v_filter+="boxcolor=black@0.50:"
   v_filter+="boxborderw=8[clocked];"
 
-  # Bottom-left: RTY and NQ current quote, lifted above the crawl.
+  # Bottom-left: RTY and NQ current quote, lifted above crawl.
   v_filter+="[clocked]drawtext="
   v_filter+="$font_arg"
   v_filter+="textfile='$QUOTE_FILE':"
@@ -436,6 +572,53 @@ build_video_filter() {
   printf "%s" "$v_filter"
 }
 
+run_ffmpeg_hls() {
+  local playlist_ffconcat="$1"
+  local hls_dir="$2"
+  local v_filter="$3"
+  local loop_mode="$4"
+
+  local loop_args=()
+
+  if [[ "$loop_mode" == "loop" ]]; then
+    loop_args=(-stream_loop -1)
+  fi
+
+  "$FFMPEG" -nostdin -hide_banner -loglevel warning \
+    -re \
+    "${loop_args[@]}" \
+    -fflags +genpts+discardcorrupt \
+    -err_detect ignore_err \
+    -f concat \
+    -safe 0 \
+    -i "$playlist_ffconcat" \
+    -map 0:v:0 \
+    -map 0:a? \
+    -vf "$v_filter" \
+    -c:v libx264 \
+    -preset veryfast \
+    -profile:v main \
+    -b:v "$VIDEO_BITRATE" \
+    -maxrate "$VIDEO_MAXRATE" \
+    -bufsize "$VIDEO_BUFSIZE" \
+    -g "$((OUTPUT_FPS * HLS_TIME))" \
+    -pix_fmt yuv420p \
+    -c:a aac \
+    -b:a "$AUDIO_BITRATE" \
+    -ar 44100 \
+    -ac 2 \
+    -dn \
+    -sn \
+    -f hls \
+    -hls_time "$HLS_TIME" \
+    -hls_list_size "$HLS_LIST_SIZE" \
+    -hls_start_number_source epoch \
+    -hls_flags delete_segments+omit_endlist+program_date_time+independent_segments \
+    -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
+    -hls_segment_filename "$hls_dir/seg_%d.ts" \
+    "$hls_dir/index.m3u8"
+}
+
 start_channel() {
   local name="$1"
   local display_name="$2"
@@ -444,12 +627,13 @@ start_channel() {
   local width="${size%%:*}"
   local height="${size##*:}"
   local hls_dir="$ROOT_HLS_DIR/$name"
-  local playlist_ffconcat="$hls_dir/files.ffconcat"
+  local main_playlist="$hls_dir/files.ffconcat"
+  local ad_playlist="$hls_dir/ad.ffconcat"
   local v_filter
 
   mkdir -p "$hls_dir"
 
-  write_concat_playlist "$media_path" "$playlist_ffconcat"
+  write_concat_playlist "$media_path" "$main_playlist"
   v_filter="$(build_video_filter "$width" "$height")"
 
   echo -e "\033[0;34m[$display_name]\033[0m Starting channel encoder..."
@@ -457,41 +641,28 @@ start_channel() {
 
   (
     while [[ ! -f "$STOP_FILE" ]]; do
-      "$FFMPEG" -nostdin -hide_banner -loglevel warning \
-        -re \
-        -stream_loop -1 \
-        -fflags +genpts+discardcorrupt \
-        -err_detect ignore_err \
-        -f concat \
-        -safe 0 \
-        -i "$playlist_ffconcat" \
-        -map 0:v:0 \
-        -map 0:a? \
-        -vf "$v_filter" \
-        -c:v libx264 \
-        -preset veryfast \
-        -profile:v main \
-        -b:v "$VIDEO_BITRATE" \
-        -maxrate "$VIDEO_MAXRATE" \
-        -bufsize "$VIDEO_BUFSIZE" \
-        -g "$((OUTPUT_FPS * HLS_TIME))" \
-        -pix_fmt yuv420p \
-        -c:a aac \
-        -b:a "$AUDIO_BITRATE" \
-        -ar 44100 \
-        -ac 2 \
-        -dn \
-        -sn \
-        -f hls \
-        -hls_time "$HLS_TIME" \
-        -hls_list_size "$HLS_LIST_SIZE" \
-        -hls_start_number_source epoch \
-        -hls_flags delete_segments+omit_endlist+program_date_time+independent_segments \
-        -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
-        -hls_segment_filename "$hls_dir/seg_%d.ts" \
-        "$hls_dir/index.m3u8"
+      if [[ -s "$AD_NOW_FILE" ]]; then
+        local ad_path=""
+        ad_path="$(cat "$AD_NOW_FILE" 2>/dev/null || true)"
 
-      if [[ ! -f "$STOP_FILE" ]]; then
+        if [[ -n "$ad_path" && -f "$ad_path" ]]; then
+          printf "COMMERCIAL BREAK\n" > "$SCROLL_FILE"
+          echo -e "\033[0;35m[$display_name]\033[0m Playing ad: $ad_path"
+
+          if write_single_file_playlist "$ad_path" "$ad_playlist"; then
+            run_ffmpeg_hls "$ad_playlist" "$hls_dir" "$v_filter" "once" || true
+          fi
+        fi
+
+        rm -f "$AD_NOW_FILE"
+        printf "%s\n" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
+        echo -e "\033[0;35m[$display_name]\033[0m Returning to programming..."
+        continue
+      fi
+
+      run_ffmpeg_hls "$main_playlist" "$hls_dir" "$v_filter" "loop" || true
+
+      if [[ ! -f "$STOP_FILE" && ! -f "$AD_NOW_FILE" ]]; then
         echo -e "\033[0;31m[$display_name]\033[0m Encoder exited. Restarting in 2 seconds..."
         sleep 2
       fi
@@ -503,15 +674,17 @@ start_channel() {
 require_runtime
 
 kill_port_listeners
-pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
+kill_encoders
 
 rm -rf "$ROOT_HLS_DIR"
 mkdir -p "$ROOT_HLS_DIR"
 
 rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
+rm -f "$AD_NOW_FILE"
+
 printf -- "--:--:--\n" > "$CLOCK_FILE"
 printf "RTY -----\nNQ  -----\n" > "$QUOTE_FILE"
-printf "%s\n" "$SCROLL_TEXT" > "$SCROLL_FILE"
+printf "%s\n" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
 
 write_channel_manifest
 
@@ -519,6 +692,7 @@ start_server
 wait_for_server
 start_clock_file
 start_quote_file
+start_ad_watcher
 
 for channel in "${CHANNELS[@]}"; do
   IFS='|' read -r name display_name media_path size <<< "$channel"
@@ -560,5 +734,8 @@ for channel in "${CHANNELS[@]}"; do
   echo ""
 done
 
+echo "Ad trigger:"
+echo "./$(basename "$0") ad 45 /path/to/foo.mp4"
+echo ""
 echo "Press Ctrl+C to stop."
 wait
