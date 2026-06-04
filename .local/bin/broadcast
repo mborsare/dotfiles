@@ -34,15 +34,19 @@ AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
 SERVER_PID=""
 CHANNELS=()
 
-CLOCK_FILE="/tmp/broadcast-clock-$$.txt"
-QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
-SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
-STOP_FILE="/tmp/broadcast-stop-$$"
+# --- RAM-Disk Strategy for 7-Day Performance ---
+# Use shared memory (/dev/shm) if available to eliminate disk I/O strain over 168 hours.
+SHM_DIR="/tmp"
+if [[ -d "/dev/shm" && -w "/dev/shm" ]]; then
+  SHM_DIR="/dev/shm"
+fi
+
+CLOCK_FILE="$SHM_DIR/broadcast-clock-$$.txt"
+QUOTE_FILE="$SHM_DIR/broadcast-quotes-$$.txt"
+SCROLL_FILE="$SHM_DIR/broadcast-scroll-$$.txt"
+STOP_FILE="$SHM_DIR/broadcast-stop-$$"
 
 # --- Ad trigger mode ---
-# Usage:
-#   ./broadcast ad 45 foo.mp4
-#   broadcastad 45 foo.mp4
 run_ad_command=0
 
 if [[ "$(basename "$0")" == "broadcastad" ]]; then
@@ -174,7 +178,7 @@ cleanup() {
   rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
   rm -f "$AD_NOW_FILE"
 
-  echo "[+] Broadcast stopped."
+  echo "[+] Broadcast stopped cleanly."
   exit 0
 }
 trap cleanup EXIT INT TERM
@@ -584,10 +588,12 @@ run_ffmpeg_hls() {
     loop_args=(-stream_loop -1)
   fi
 
+  # Optimized flags targeting deep 7-day runtime loops 
   "$FFMPEG" -nostdin -hide_banner -loglevel warning \
     -re \
     "${loop_args[@]}" \
     -fflags +genpts+discardcorrupt \
+    -reconnect 1 -reconnect_at_eof 1 \
     -err_detect ignore_err \
     -f concat \
     -safe 0 \
@@ -720,7 +726,7 @@ for channel in "${CHANNELS[@]}"; do
 done
 
 echo -e "\n\033[1;32m------------------------------------------------\033[0m"
-echo -e "\033[1;32m   PRIME BROADCAST LIVE \033[0m"
+echo -e "\033[1;32m    PRIME BROADCAST LIVE (7-DAY RUN TIME)       \033[0m"
 echo -e "\033[1;32m------------------------------------------------\033[0m"
 
 echo -e "\033[1mManifest:\033[0m http://localhost:$PORT/channels.json"
@@ -737,5 +743,7 @@ done
 echo "Ad trigger:"
 echo "./$(basename "$0") ad 45 /path/to/foo.mp4"
 echo ""
-echo "Press Ctrl+C to stop."
-wait
+echo "Press Ctrl+C to stop or it will self-terminate in exactly 7 days."
+
+# Enforce a hard timeout ceiling for exactly 7 days (604,800 seconds)
+timeout 604800 wait || cleanup
