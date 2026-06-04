@@ -2,43 +2,39 @@
 set -euo pipefail
 
 # --- Configuration ---
-PORT="8090"
-BIND_ADDR="127.0.0.1"
-ROOT_HLS_DIR="/tmp/broadcast-hls"
-FFMPEG="ffmpeg"
-FFPROBE="ffprobe"
-LOGO_PATH="$HOME/Documents/Prime/logotype.png"
+PORT="${PORT:-8090}"
+BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+ROOT_HLS_DIR="${ROOT_HLS_DIR:-/tmp/broadcast-hls}"
+FFMPEG="${FFMPEG:-ffmpeg}"
+FFPROBE="${FFPROBE:-ffprobe}"
+LOGO_PATH="${LOGO_PATH:-$HOME/Documents/Prime/logotype.png}"
+
+OUTPUT_FPS="${OUTPUT_FPS:-24}"
+VIDEO_BITRATE="${VIDEO_BITRATE:-1600k}"
+VIDEO_MAXRATE="${VIDEO_MAXRATE:-2000k}"
+VIDEO_BUFSIZE="${VIDEO_BUFSIZE:-4000k}"
+AUDIO_BITRATE="${AUDIO_BITRATE:-96k}"
+
+HLS_TIME="${HLS_TIME:-1}"
+HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
+HLS_DELETE_THRESHOLD="${HLS_DELETE_THRESHOLD:-3}"
+
+DEFAULT_MEDIA_DIR="${DEFAULT_MEDIA_DIR:-$HOME/Documents/Will-broadcast/}"
+DEFAULT_SIZE="${DEFAULT_SIZE:-960:540}"
+
+QUOTE_BASE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
+QUOTE_REFRESH_SECONDS="${QUOTE_REFRESH_SECONDS:-15}"
+
+SCROLL_TEXT="${SCROLL_TEXT:-Welcome our special guest AEDAN!. Hi Aedan}"
+SCROLL_SPEED="${SCROLL_SPEED:-95}"
+
 SERVER_PID=""
-
-
-CLOCK_FILE="/tmp/broadcast-clocks-$$.txt"
-NQ_NOW_FILE="/tmp/broadcast-nq-now-$$.txt"
-HEADLINE_FILE="/tmp/broadcast-headlines-$$.txt"
-SLEEP_FILE="/tmp/broadcast-sleep.txt"
-
-NQ_NOW_URL="https://weather.mborsare.workers.dev/prime/weather/NQ"
-
-HEADLINE_SOURCES=(
-  "NYT|https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml"
-  "WAPO|https://feeds.washingtonpost.com/rss/homepage"
-  "BBC|https://feeds.bbci.co.uk/news/rss.xml"
-  "AP|https://feeds.apnews.com/rss/apf-topnews"
-)
-
-OUTPUT_FPS="24"
-VIDEO_BITRATE="1600k"
-VIDEO_MAXRATE="2000k"
-VIDEO_BUFSIZE="4000k"
-AUDIO_BITRATE="96k"
-
-HLS_TIME="1"
-HLS_LIST_SIZE="6"
-HLS_DELETE_THRESHOLD="3"
-
-DEFAULT_MEDIA_DIR="$HOME/Documents/Will-broadcast/"
-DEFAULT_SIZE="960:540"
-
 CHANNELS=()
+
+CLOCK_FILE="/tmp/broadcast-clock-$$.txt"
+QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
+SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
+STOP_FILE="/tmp/broadcast-stop-$$"
 
 if [[ $# -gt 0 ]]; then
   n=1
@@ -59,8 +55,6 @@ if [[ $# -gt 0 ]]; then
 else
   CHANNELS+=("Prime|Prime|$DEFAULT_MEDIA_DIR|$DEFAULT_SIZE")
 fi
-
-STOP_FILE="/tmp/broadcast-stop-$$"
 
 kill_port_listeners() {
   local pids=""
@@ -102,7 +96,7 @@ require_runtime() {
 
 cleanup() {
   touch "$STOP_FILE"
-  echo -e "\n\033[0;31m[!] Atomic Cleanup Initiated...\033[0m"
+  echo -e "\n\033[0;31m[!] Cleanup...\033[0m"
 
   kill_port_listeners
 
@@ -115,11 +109,7 @@ cleanup() {
   pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
   rm -rf "$ROOT_HLS_DIR"
 
-  rm -f "$STOP_FILE"
-  rm -f "$CLOCK_FILE"
-  rm -f "$NQ_NOW_FILE"
-  rm -f "$HEADLINE_FILE"
-  : > "$SLEEP_FILE"
+  rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
 
   echo "[+] Broadcast stopped."
   exit 0
@@ -141,11 +131,12 @@ class HLSHandler(http.server.SimpleHTTPRequestHandler):
         super().__init__(*args, directory=ROOT, **kwargs)
 
     def guess_type(self, path):
-        if str(path).endswith(".m3u8"):
+        path = str(path)
+        if path.endswith(".m3u8"):
             return "application/vnd.apple.mpegurl"
-        if str(path).endswith(".ts"):
+        if path.endswith(".ts"):
             return "video/mp2t"
-        if str(path).endswith(".json"):
+        if path.endswith(".json"):
             return "application/json"
         return super().guess_type(path)
 
@@ -188,145 +179,82 @@ wait_for_server() {
 start_clock_file() {
   (
     while [[ ! -f "$STOP_FILE" ]]; do
-      local nq_now
-      nq_now="$(cat "$NQ_NOW_FILE" 2>/dev/null || printf "-----")"
-
-      printf "Now is %s  //  NQ %s\n" \
-        "$(date '+%H:%M:%S')" \
-        "$nq_now" \
-        > "$CLOCK_FILE"
-
+      date '+%H:%M:%S' > "$CLOCK_FILE"
       sleep 1
     done
   ) &
 }
 
-start_nq_now_file() {
-  (
-    while [[ ! -f "$STOP_FILE" ]]; do
-      curl -sf --max-time 5 "$NQ_NOW_URL" \
-        | python3 -c '
-import json
-import sys
+fetch_quote() {
+  local symbol="$1"
+  local url="$QUOTE_BASE_URL/$symbol"
+  local out=""
 
-nq_now_file = "'"$NQ_NOW_FILE"'"
+  out="$(curl -sf --max-time 5 "$url" 2>/dev/null | python3 -c '
+import json
+import math
+import sys
 
 try:
     d = json.load(sys.stdin)
-    prices = d.get("priceSeries", [])
+    price = None
 
-    if not prices:
-        raise ValueError("missing data")
+    if isinstance(d, dict):
+        for key in ("price", "last", "mark", "close", "c"):
+            if d.get(key) is not None:
+                price = d[key]
+                break
 
-    latest = prices[-1]
-    latest_mid = (float(latest["hi"]) + float(latest["lo"])) / 2
+        series = d.get("priceSeries") or d.get("prices") or d.get("data") or []
+        if price is None and isinstance(series, list) and series:
+            latest = series[-1]
+            if isinstance(latest, dict):
+                for key in ("last", "price", "mark", "close", "c"):
+                    if latest.get(key) is not None:
+                        price = latest[key]
+                        break
+                if price is None and latest.get("hi") is not None and latest.get("lo") is not None:
+                    price = (float(latest["hi"]) + float(latest["lo"])) / 2
+            else:
+                price = latest
 
-    with open(nq_now_file, "w") as f:
-        f.write(str(int(latest_mid)))
+    if price is None:
+        raise ValueError("missing price")
 
+    value = float(price)
+    if not math.isfinite(value):
+        raise ValueError("bad price")
+
+    if abs(value - round(value)) < 0.001:
+        print(str(int(round(value))))
+    else:
+        print((f"{value:.2f}").rstrip("0").rstrip("."))
 except Exception:
-    with open(nq_now_file, "w") as f:
-        f.write("-----")
-' || printf -- "-----\n" > "$NQ_NOW_FILE"
+    print("-----")
+' 2>/dev/null || true)"
 
-      sleep 60
-    done
-  ) &
+  if [[ -z "$out" ]]; then
+    out="-----"
+  fi
+
+  printf "%s" "$out"
 }
 
-fetch_headline() {
-  python3 - "${HEADLINE_SOURCES[@]}" <<'PY'
-import random
-import re
-import sys
-import urllib.request
-import xml.etree.ElementTree as ET
-from html import unescape
-
-LIMIT_PER_SOURCE = 8
-PICKS = 5
-
-items = []
-seen = set()
-
-def clean(s):
-    s = unescape(s or "")
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = re.sub(r"[\r\n\t]+", " ", s)
-    s = re.sub(r"[\\'%\[\]=]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:180]
-
-for raw in sys.argv[1:]:
-    try:
-        label, feed = raw.split("|", 1)
-
-        req = urllib.request.Request(
-            feed,
-            headers={
-                "User-Agent": "Mozilla/5.0 PrimeBroadcast/1.0",
-                "Accept": "application/rss+xml, application/xml, text/xml, */*",
-            },
-        )
-
-        with urllib.request.urlopen(req, timeout=4) as response:
-            body = response.read()
-
-        root = ET.fromstring(body)
-
-        found = []
-
-        # RSS: channel/item/title
-        for item in root.findall(".//item"):
-            title_el = item.find("title")
-            if title_el is not None and title_el.text:
-                found.append(title_el.text)
-
-        # Atom fallback: entry/title
-        if not found:
-            ns = {"atom": "http://www.w3.org/2005/Atom"}
-            for entry in root.findall(".//atom:entry", ns):
-                title_el = entry.find("atom:title", ns)
-                if title_el is not None and title_el.text:
-                    found.append(title_el.text)
-
-        for title in found[:LIMIT_PER_SOURCE]:
-            title = clean(title)
-            if not title:
-                continue
-
-            key = title.lower()
-            if key in seen:
-                continue
-
-            seen.add(key)
-            items.append(f"{label}: {title}")
-
-    except Exception:
-        continue
-
-if items:
-    random.shuffle(items)
-    print("   //   ".join(items[:PICKS]))
-else:
-    print("PRIME BROADCAST")
-PY
-}
-
-start_headline_file() {
+start_quote_file() {
   (
     while [[ ! -f "$STOP_FILE" ]]; do
-      local headline
-      headline="$(fetch_headline)"
+      local rty_now="-----"
+      local nq_now="-----"
 
-      if [[ -z "$headline" ]]; then
-        headline="PRIME BROADCAST"
-      fi
+      rty_now="$(fetch_quote RTY)"
+      nq_now="$(fetch_quote NQ)"
 
-      printf "%s\n" "$headline" > "$HEADLINE_FILE"
-      echo -e "\033[0;33m[chyron]\033[0m $headline"
+      {
+        printf "RTY %s\n" "$rty_now"
+        printf "NQ  %s\n" "$nq_now"
+      } > "$QUOTE_FILE"
 
-      sleep 600
+      sleep "$QUOTE_REFRESH_SECONDS"
     done
   ) &
 }
@@ -340,16 +268,14 @@ import sys
 
 manifest = sys.argv[1]
 channels = sys.argv[2:]
-
 out = []
 
 for i, raw in enumerate(channels):
     name, display_name, _media_path, _size = raw.split("|", 3)
-
     out.append({
         "number": f"{i + 3:02d}",
         "name": display_name.upper(),
-        "path": f"/{name}/index.m3u8"
+        "path": f"/{name}/index.m3u8",
     })
 
 with open(manifest, "w", encoding="utf-8") as f:
@@ -371,7 +297,6 @@ from pathlib import Path
 media_path = Path(sys.argv[1]).expanduser()
 playlist = Path(sys.argv[2])
 ffprobe = sys.argv[3]
-
 exts = {".mp4", ".mkv", ".mov", ".m4v", ".webm"}
 
 def has_video(path):
@@ -439,6 +364,7 @@ build_video_filter() {
   local height="$2"
   local font_path=""
   local font_arg=""
+  local v_filter=""
 
   if command -v fc-match >/dev/null 2>&1; then
     font_path="$(fc-match -f '%{file}\n' 'ComicShannsMono Nerd Font' 2>/dev/null | head -n 1 || true)"
@@ -452,45 +378,56 @@ build_video_filter() {
     font_arg="fontfile='$font_path':"
   fi
 
-  local v_filter
+  printf "%s\n" "$SCROLL_TEXT" > "$SCROLL_FILE"
+
   v_filter="fps=$OUTPUT_FPS,"
   v_filter+="setsar=1,"
   v_filter+="scale=$width:$height:force_original_aspect_ratio=decrease:force_divisible_by=2,"
   v_filter+="pad=$width:$height:(ow-iw)/2:(oh-ih)/2,"
-  v_filter+="setsar=1,format=yuv420p [main];"
+  v_filter+="setsar=1,format=yuv420p[main];"
 
   if [[ -f "$LOGO_PATH" ]]; then
-    v_filter+="movie='$LOGO_PATH',scale=76:-1 [logo];"
-    v_filter+="[main][logo] overlay=W-w-22:24 [combined];"
+    v_filter+="movie='$LOGO_PATH',scale=92:-1[logo];"
+    v_filter+="[main][logo]overlay=W-w-24:24[base];"
   else
-    v_filter+="[main] null [combined];"
+    v_filter+="[main]null[base];"
   fi
 
-  v_filter+="[combined] drawtext="
+  # Top-left: time only, HH:MM:SS.
+  v_filter+="[base]drawtext="
   v_filter+="$font_arg"
   v_filter+="textfile='$CLOCK_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=24:"
-  v_filter+="y=20:"
-  v_filter+="fontsize=15:"
-  v_filter+="fontcolor=0xF4E66A [clocked];"
+  v_filter+="y=22:"
+  v_filter+="fontsize=24:"
+  v_filter+="fontcolor=white:"
+  v_filter+="box=1:"
+  v_filter+="boxcolor=black@0.50:"
+  v_filter+="boxborderw=8[clocked];"
 
-  v_filter+="[clocked] drawtext="
+  # Bottom-left: RTY and NQ current quote, lifted above the crawl.
+  v_filter+="[clocked]drawtext="
   v_filter+="$font_arg"
-  v_filter+="textfile='$HEADLINE_FILE':"
+  v_filter+="textfile='$QUOTE_FILE':"
   v_filter+="reload=1:"
-  v_filter+="x=W-mod(t*42\\,W+tw):"
-  v_filter+="y=H-36:"
-  v_filter+="fontsize=20:"
-  v_filter+="fontcolor=0xF4E66A [headlined];"
+  v_filter+="x=24:"
+  v_filter+="y=H-th-74:"
+  v_filter+="line_spacing=8:"
+  v_filter+="fontsize=22:"
+  v_filter+="fontcolor=white:"
+  v_filter+="box=1:"
+  v_filter+="boxcolor=black@0.50:"
+  v_filter+="boxborderw=10[quoted];"
 
-  v_filter+="[headlined] drawtext="
+  # Bottom crawl.
+  v_filter+="[quoted]drawtext="
   v_filter+="$font_arg"
-  v_filter+="textfile='$SLEEP_FILE':"
+  v_filter+="textfile='$SCROLL_FILE':"
   v_filter+="reload=1:"
-  v_filter+="x=W-tw-24:"
-  v_filter+="y=H-th-62:"
-  v_filter+="fontsize=18:"
+  v_filter+="x=W-mod(t*$SCROLL_SPEED\\,W+tw):"
+  v_filter+="y=H-th-22:"
+  v_filter+="fontsize=24:"
   v_filter+="fontcolor=white:"
   v_filter+="box=1:"
   v_filter+="boxcolor=black@0.55:"
@@ -515,7 +452,7 @@ start_channel() {
   write_concat_playlist "$media_path" "$playlist_ffconcat"
   v_filter="$(build_video_filter "$width" "$height")"
 
-  echo -e "\033[0;34m[$display_name]\033[0m Starting efficient always-on channel encoder..."
+  echo -e "\033[0;34m[$display_name]\033[0m Starting channel encoder..."
   echo "source: $media_path"
 
   (
@@ -528,6 +465,8 @@ start_channel() {
         -f concat \
         -safe 0 \
         -i "$playlist_ffconcat" \
+        -map 0:v:0 \
+        -map 0:a? \
         -vf "$v_filter" \
         -c:v libx264 \
         -preset veryfast \
@@ -537,11 +476,12 @@ start_channel() {
         -bufsize "$VIDEO_BUFSIZE" \
         -g "$((OUTPUT_FPS * HLS_TIME))" \
         -pix_fmt yuv420p \
-        -af "aresample=async=1:first_pts=0" \
         -c:a aac \
         -b:a "$AUDIO_BITRATE" \
         -ar 44100 \
         -ac 2 \
+        -dn \
+        -sn \
         -f hls \
         -hls_time "$HLS_TIME" \
         -hls_list_size "$HLS_LIST_SIZE" \
@@ -568,23 +508,17 @@ pkill -9 -f "$ROOT_HLS_DIR" 2>/dev/null || true
 rm -rf "$ROOT_HLS_DIR"
 mkdir -p "$ROOT_HLS_DIR"
 
-rm -f "$STOP_FILE"
-rm -f "$CLOCK_FILE"
-rm -f "$NQ_NOW_FILE"
-rm -f "$HEADLINE_FILE"
-
-printf "Now is --:--:--  //  NQ -----\n" > "$CLOCK_FILE"
-printf -- "-----\n" > "$NQ_NOW_FILE"
-printf "PRIME BROADCAST\n" > "$HEADLINE_FILE"
-: > "$SLEEP_FILE"
+rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
+printf -- "--:--:--\n" > "$CLOCK_FILE"
+printf "RTY -----\nNQ  -----\n" > "$QUOTE_FILE"
+printf "%s\n" "$SCROLL_TEXT" > "$SCROLL_FILE"
 
 write_channel_manifest
 
 start_server
 wait_for_server
 start_clock_file
-start_nq_now_file
-start_headline_file
+start_quote_file
 
 for channel in "${CHANNELS[@]}"; do
   IFS='|' read -r name display_name media_path size <<< "$channel"
@@ -597,18 +531,18 @@ for channel in "${CHANNELS[@]}"; do
   IFS='|' read -r name _ _ _ <<< "$channel"
   ready=0
 
-for _ in {1..120}; do
-  if [[ -f "$ROOT_HLS_DIR/$name/index.m3u8" ]]; then
-    ready=1
-    break
-  fi
-  sleep 0.5
-done
+  for _ in {1..120}; do
+    if [[ -f "$ROOT_HLS_DIR/$name/index.m3u8" ]]; then
+      ready=1
+      break
+    fi
+    sleep 0.5
+  done
 
-if [[ "$ready" -ne 1 ]]; then
-  echo "[error] $name never produced index.m3u8" >&2
-  exit 1
-fi
+  if [[ "$ready" -ne 1 ]]; then
+    echo "[error] $name never produced index.m3u8" >&2
+    exit 1
+  fi
 done
 
 echo -e "\n\033[1;32m------------------------------------------------\033[0m"
@@ -628,5 +562,3 @@ done
 
 echo "Press Ctrl+C to stop."
 wait
-
-
