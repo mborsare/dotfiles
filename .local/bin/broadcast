@@ -34,7 +34,6 @@ AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
 SERVER_PID=""
 CHANNELS=()
 
-CLOCK_FILE="/tmp/broadcast-clock-$$.txt"
 QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
 SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
 STOP_FILE="/tmp/broadcast-stop-$$"
@@ -168,7 +167,7 @@ cleanup() {
   kill_encoders
   rm -rf "$ROOT_HLS_DIR"
 
-  rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
+  rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
   rm -f "$AD_NOW_FILE"
 
   echo "[+] Broadcast stopped."
@@ -234,15 +233,6 @@ wait_for_server() {
   echo "[error] Web server did not become reachable at $url" >&2
   cat /tmp/broadcast-server.log >&2 2>/dev/null || true
   exit 1
-}
-
-start_clock_file() {
-  (
-    while [[ ! -f "$STOP_FILE" ]]; do
-      date '+%H:%M:%S' > "$CLOCK_FILE"
-      sleep 1
-    done
-  ) &
 }
 
 fetch_quote() {
@@ -526,11 +516,11 @@ build_video_filter() {
     v_filter+="[main]null[base];"
   fi
 
-  # Top-left: time only, HH:MM:SS.
+  # Top-left: FFmpeg-rendered local clock, HH:MM:SS.
+  # No textfile helper needed; drawtext updates %{localtime} itself.
   v_filter+="[base]drawtext="
   v_filter+="$font_arg"
-  v_filter+="textfile='$CLOCK_FILE':"
-  v_filter+="reload=1:"
+  v_filter+="text='%{localtime\:%T}':"
   v_filter+="x=24:"
   v_filter+="y=22:"
   v_filter+="fontsize=24:"
@@ -678,10 +668,9 @@ kill_encoders
 rm -rf "$ROOT_HLS_DIR"
 mkdir -p "$ROOT_HLS_DIR"
 
-rm -f "$STOP_FILE" "$CLOCK_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
+rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
 rm -f "$AD_NOW_FILE"
 
-printf -- "--:--:--\n" > "$CLOCK_FILE"
 printf "RTY -----\nNQ  -----\n" > "$QUOTE_FILE"
 printf "%s\n" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
 
@@ -689,7 +678,6 @@ write_channel_manifest
 
 start_server
 wait_for_server
-start_clock_file
 start_quote_file
 start_ad_watcher
 
