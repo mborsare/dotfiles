@@ -193,6 +193,8 @@ venv() {
 # ── Zsh Settings & Completion ────────────────────────────────────────────────
 autoload -Uz colors && colors
 autoload -Uz compinit
+autoload -Uz vcs_info
+autoload -Uz add-zsh-hook
 
 # Needed for menu-select tab completion.
 zmodload zsh/complist 2>/dev/null
@@ -200,6 +202,17 @@ zmodload zsh/complist 2>/dev/null
 zstyle ':completion:*' matcher-list 'm:{a-z}={A-Za-z}'
 zstyle ':completion:*' menu select
 zstyle ':completion:*' list-colors "${(s.:.)LS_COLORS}"
+
+# Git branch in prompt.
+zstyle ':vcs_info:*' enable git
+zstyle ':vcs_info:git:*' formats ' %F{118} %b%f'
+zstyle ':vcs_info:git:*' actionformats ' %F{214} %b|%a%f'
+
+_prime_vcs_precmd() {
+  vcs_info
+}
+
+add-zsh-hook precmd _prime_vcs_precmd
 
 # -u ignores insecure completion dir warnings on your own box.
 compinit -u
@@ -223,6 +236,4 @@ battery_pct() {
   fi
 }
 
-PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~ %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
-
-
+PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~${vcs_info_msg_0_} %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
