@@ -293,14 +293,11 @@ except Exception:
 start_quote_file() {
   (
     while [[ ! -f "$STOP_FILE" ]]; do
-      local rty_now="-----"
       local nq_now="-----"
 
-      rty_now="$(fetch_quote RTY)"
       nq_now="$(fetch_quote NQ)"
 
       {
-        printf "RTY %s\n" "$rty_now"
         printf "NQ  %s\n" "$nq_now"
       } > "$QUOTE_FILE"
 
@@ -529,7 +526,7 @@ build_video_filter() {
   v_filter+="boxcolor=black@0.50:"
   v_filter+="boxborderw=8[clocked];"
 
-  # Bottom-left: RTY and NQ current quote, lifted above crawl.
+  # Bottom-left: NQ current quote, lifted above crawl.
   v_filter+="[clocked]drawtext="
   v_filter+="$font_arg"
   v_filter+="textfile='$QUOTE_FILE':"
@@ -671,7 +668,7 @@ mkdir -p "$ROOT_HLS_DIR"
 rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
 rm -f "$AD_NOW_FILE"
 
-printf "RTY -----\nNQ  -----\n" > "$QUOTE_FILE"
+printf "-----\n" > "$QUOTE_FILE"
 printf "%s\n" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
 
 write_channel_manifest
