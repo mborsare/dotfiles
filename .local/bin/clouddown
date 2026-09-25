@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOUNT="$HOME/mnt/cloud"
+
+umount "$MOUNT" 2>/dev/null || diskutil unmount "$MOUNT"
+echo "unmounted cloud"

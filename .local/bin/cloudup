@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MOUNT="$HOME/mnt/cloud"
+REMOTE="mikeb@oldbook:/mnt/PRIME"
+
+mkdir -p "$MOUNT"
+
+if mount | grep -q "on $MOUNT "; then
+  echo "cloud already mounted at $MOUNT"
+  exit 0
+fi
+
+sshfs "$REMOTE" "$MOUNT" \
+  -o reconnect \
+  -o ServerAliveInterval=15 \
+  -o ServerAliveCountMax=3 \
+  -o defer_permissions \
+  -o volname=oldcloud
+
+echo "mounted cloud at $MOUNT"
