@@ -1,148 +1,241 @@
 #!/usr/bin/env zsh
 
-# --- Configuration ---
-input="$1"
+# enhance <file> [minutes] [chunk_seconds]
+
+setopt ERR_EXIT PIPE_FAIL NULL_GLOB
+
+# --- Args ---
+input="${1:-}"
 minutes="${2:-}"
 chunk_seconds="${3:-60}"
-warmup_limit=180
-model="realesr-animevideov3-x4"
-cache_root="$HOME/.cache/up"
+
+# --- Config ---
+model="${UP_MODEL:-ultramix-balanced-4x}"
+scale="${UP_SCALE:-2}"
+jobs="${UP_JOBS:-3:3:3}"
 max_gb="${UP_MAX_SCRATCH_GB:-10}"
+warmup_seconds="${UP_WARMUP_SECONDS:-900}"
+
+upscayl_bin="${UPSCAYL_BIN:-/Applications/Upscayl.app/Contents/Resources/bin/upscayl-bin}"
+upscayl_models="${UPSCAYL_MODELS:-/Applications/Upscayl.app/Contents/Resources/models}"
 
 # --- Validation ---
 [[ -z "$input" ]] && { echo "✗ usage: enhance <file> [minutes] [chunk_seconds]"; exit 1; }
 [[ ! -f "$input" ]] && { echo "✗ not found: $input"; exit 1; }
+[[ ! -x "$upscayl_bin" ]] && { echo "✗ upscayl-bin not found: $upscayl_bin"; exit 1; }
+
+command -v ffmpeg >/dev/null || { echo "✗ ffmpeg not found"; exit 1; }
+command -v ffprobe >/dev/null || { echo "✗ ffprobe not found"; exit 1; }
 
 abs_input="$(realpath "$input")"
 base_name="$(basename "$abs_input" | sed 's/\.[^.]*$//')"
 
-run_dir="$cache_root/$base_name"
+# Local visible scratch beside source file
+run_dir="${abs_input%.*}.upwork"
 chunks_dir="$run_dir/chunks"
 parts_dir="$run_dir/parts"
 work_dir="$run_dir/work"
+frames_dir="$work_dir/frames"
+upscaled_dir="$work_dir/upscaled"
 log_file="$run_dir/run.log"
 
-mkdir -p "$chunks_dir" "$parts_dir" "$work_dir"
+mkdir -p "$chunks_dir" "$parts_dir" "$frames_dir" "$upscaled_dir"
 touch "$log_file"
 
-# --- Setup Helpers ---
-_log() { printf '%s  %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$log_file"; }
+# --- Helpers ---
+_log() {
+  printf '%s  %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$log_file"
+}
+
+_die() {
+  _log "✗ $*"
+  exit 1
+}
 
 _check_space() {
-  used="$(du -sm "$run_dir" 2>/dev/null | awk '{print $1}')"
-  (( used > max_gb * 1024 ))
+  local used_mb limit_mb
+  used_mb="$(du -sm "$run_dir" 2>/dev/null | awk '{print $1}')"
+  limit_mb=$(( max_gb * 1024 ))
+
+  (( used_mb > limit_mb ))
 }
 
-_cleanup_chunk_dirs() {
-  rm -rf "$work_dir/frames" "$work_dir/upscaled"
-  mkdir -p "$work_dir/frames" "$work_dir/upscaled"
+_clean_work() {
+  rm -rf "$frames_dir" "$upscaled_dir"
+  mkdir -p "$frames_dir" "$upscaled_dir"
 }
 
-# --- Background Management ---
-caffeinate -dimsu -w $$ &
-caf_pid=$!
-# Kill caffeinate if script is interrupted or finishes
-trap "kill $caf_pid 2>/dev/null; exit" INT TERM EXIT
+_stop_awake() {
+  [[ -n "${caf_pid:-}" ]] && kill "$caf_pid" 2>/dev/null || true
+}
 
-_log "▶ starting: $base_name (PID: $$)"
+# --- Keep Mac awake ---
+caf_pid=""
+if command -v caffeinate >/dev/null; then
+  caffeinate -dimsu -w $$ &
+  caf_pid=$!
+fi
 
-# --- Logic ---
+trap '_stop_awake; exit 130' INT
+trap '_stop_awake; exit 143' TERM
+trap '_stop_awake' EXIT
+
+_log "▶ starting: $base_name"
+_log "→ model: $model @ ${scale}x"
+_log "→ scratch: $run_dir"
+
+# --- Deadline ---
 deadline=0
 [[ -n "$minutes" ]] && deadline=$(( $(date +%s) + minutes * 60 ))
 
-# 1. Splitting
-if [[ -z "$(find "$chunks_dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+# --- FPS ---
+fps="$(ffprobe -v error -select_streams v:0 \
+  -show_entries stream=avg_frame_rate \
+  -of default=noprint_wrappers=1:nokey=1 \
+  "$abs_input")"
+
+[[ -z "$fps" || "$fps" == "0/0" ]] && fps="24000/1001"
+
+# --- Split only if no chunks and no parts exist ---
+chunks=( "$chunks_dir"/chunk_*.mkv )
+parts=( "$parts_dir"/part_*.mp4 )
+
+if (( ${#chunks[@]} == 0 && ${#parts[@]} == 0 )); then
   _log "→ splitting into ${chunk_seconds}s chunks..."
+
   ffmpeg -loglevel error -y -i "$abs_input" \
     -c copy -map 0 \
     -f segment -segment_time "$chunk_seconds" -reset_timestamps 1 \
-    "$chunks_dir/chunk_%03d.mkv" || { _log "✗ split failed"; exit 1; }
+    "$chunks_dir/chunk_%04d.mkv" || _die "split failed"
 fi
 
-fps="$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=noprint_wrappers=1:nokey=1 "$abs_input")"
-[[ -z "$fps" || "$fps" == "0/0" ]] && fps="24000/1001"
-
-part_idx=0
-for chunk in "$chunks_dir"/chunk_*.*; do
+# --- Process chunks ---
+for chunk in "$chunks_dir"/chunk_*.mkv; do
   [[ -e "$chunk" ]] || continue
-  
+
+  chunk_base="$(basename "$chunk")"
+  part_num="$(echo "$chunk_base" | sed -E 's/chunk_([0-9]+)\.mkv/\1/')"
+  part_file="$parts_dir/part_${part_num}.mp4"
+
+  if [[ -s "$part_file" ]]; then
+    _log "→ skipping existing part: $(basename "$part_file")"
+    rm -f "$chunk"
+    continue
+  fi
+
   if [[ "$deadline" -gt 0 && "$(date +%s)" -ge "$deadline" ]]; then
-    _log "→ time limit reached."
+    _log "→ time limit reached"
     break
   fi
 
   if _check_space; then
-    _log "✗ scratch limit ${max_gb}GB reached."
-    exit 1
+    _die "scratch limit ${max_gb}GB reached"
   fi
 
-  _cleanup_chunk_dirs
-  frames_dir="$work_dir/frames"
-  upscaled_dir="$work_dir/upscaled"
-  part_file="$(printf '%s/part_%03d.mp4' "$parts_dir" "$part_idx")"
+  _clean_work
 
-  _log "→ processing $(basename "$chunk")"
+  _log "→ processing $chunk_base"
 
-  # 2. Extract Frames
+  # 1. Extract lossless PNG frames.
+  # No denoise, sharpening, contrast, saturation, or JPEG compression.
   ffmpeg -loglevel error -y -i "$chunk" \
-    -vf "hqdn3d=1.2:1.2:4:4,unsharp=3:3:0.6:3:3:0.0" \
-    -q:v 2 "$frames_dir/frame_%05d.jpg" || { _log "✗ extract failed"; exit 1; }
+    -vsync 0 \
+    "$frames_dir/frame_%05d.png" || _die "extract failed"
 
-  total="$(find "$frames_dir" -name 'frame_*.jpg' | wc -l | tr -d ' ')"
-  [[ "$total" -eq 0 ]] && { _log "✗ no frames extracted"; exit 1; }
+  total="$(find "$frames_dir" -name 'frame_*.png' | wc -l | tr -d ' ')"
+  [[ "$total" -eq 0 ]] && _die "no frames extracted"
 
-  # 3. Upscale
-  /Applications/Upscayl.app/Contents/Resources/bin/upscayl-bin \
-    -i "$frames_dir" -o "$upscaled_dir" -s 2 -n "$model" \
-    -m "/Applications/Upscayl.app/Contents/Resources/models" -j 4:4:4 >/dev/null 2>&1 &
+  # 2. Upscale
+  "$upscayl_bin" \
+    -i "$frames_dir" \
+    -o "$upscaled_dir" \
+    -s "$scale" \
+    -n "$model" \
+    -m "$upscayl_models" \
+    -j "$jobs" >/dev/null 2>&1 &
+
   up_pid=$!
+  no_output_seconds=0
 
-  warmup_count=0
   while kill -0 "$up_pid" 2>/dev/null; do
     sleep 5
-    cur="$(find "$upscaled_dir" -maxdepth 1 -name "*.png" | wc -l | tr -d ' ')"
-    printf "\r\033[K   upscaling chunk %03d: %d/%d" "$part_idx" "$cur" "$total"
+
+    cur="$(find "$upscaled_dir" -maxdepth 1 -name '*.png' | wc -l | tr -d ' ')"
+    printf "\r\033[K   upscaling chunk %s: %d/%d" "$part_num" "$cur" "$total"
 
     if [[ "$cur" -eq 0 ]]; then
-      (( warmup_count++ ))
-      if [[ "$warmup_count" -ge "$warmup_limit" ]]; then
-        kill -9 "$up_pid" 2>/dev/null
-        _log "✗ warmup timeout"
-        exit 1
+      no_output_seconds=$(( no_output_seconds + 5 ))
+
+      if (( no_output_seconds >= warmup_seconds )); then
+        kill -9 "$up_pid" 2>/dev/null || true
+        printf "\n"
+        _die "warmup timeout"
       fi
     fi
   done
+
   printf "\n"
 
-  # 4. Cleanup & Assemble Part
-  find "$upscaled_dir" -name "frame_*.png" | while read -r f; do
-    clean_name=$(echo "$f" | sed -E 's/frame_([0-9]+).*\.png/frame_\1.png/')
-    [[ "$f" != "$clean_name" ]] && mv "$f" "$clean_name"
+  wait "$up_pid" || _die "upscayl failed"
+
+  # 3. Normalize Upscayl filenames
+  for f in "$upscaled_dir"/*.png; do
+    clean_name="$(echo "$f" | sed -E 's/frame_([0-9]+).*\.png/frame_\1.png/')"
+    [[ "$f" != "$clean_name" ]] && mv -f "$f" "$clean_name"
   done
 
-  concat_file="$work_dir/concat.txt"
-  printf "file '%s'\n" "$upscaled_dir"/frame_*.png | sort -V > "$concat_file"
+  done_count="$(find "$upscaled_dir" -maxdepth 1 -name 'frame_*.png' | wc -l | tr -d ' ')"
+  [[ "$done_count" -eq 0 ]] && _die "no upscaled frames found"
 
-  ffmpeg -loglevel error -y -f concat -safe 0 -r "$fps" -i "$concat_file" \
-    -i "$chunk" -map 0:v -map "1:a?" \
-    -vf "eq=contrast=1.05:saturation=1.1,unsharp=3:3:0.5" \
-    -c:v libx264 -pix_fmt yuv420p -crf 18 -preset fast -c:a copy \
-    "$part_file" || { _log "✗ assembly failed"; exit 1; }
+  # 4. Assemble part.
+  # Leave Ultramix output untouched before encoding.
+  ffmpeg -loglevel error -y \
+    -framerate "$fps" \
+    -i "$upscaled_dir/frame_%05d.png" \
+    -i "$chunk" \
+    -map 0:v:0 -map "1:a?" \
+    -c:v libx264 \
+    -pix_fmt yuv420p \
+    -crf 18 \
+    -preset fast \
+    -c:a aac \
+    -b:a 192k \
+    -movflags +faststart \
+    -shortest \
+    "$part_file" || _die "assembly failed"
 
   _log "✓ part done: $(basename "$part_file")"
+
   rm -f "$chunk"
-  (( part_idx++ ))
 done
 
-# 5. Final Concat
+# --- Final concat ---
+parts=( "$parts_dir"/part_*.mp4 )
+
+if (( ${#parts[@]} == 0 )); then
+  _die "no parts made"
+fi
+
 _log "→ concatenating final output"
+
 final_concat="$run_dir/final_concat.txt"
-printf "file '%s'\n" "$parts_dir"/part_*.mp4 | sort -V > "$final_concat"
+: > "$final_concat"
 
-ffmpeg -loglevel error -y -f concat -safe 0 -i "$final_concat" \
-  -c copy "${abs_input%.*}_up.mp4" && _log "✓ done: ${abs_input%.*}_up.mp4"
+for part in "$parts_dir"/part_*.mp4; do
+  printf "file '%s'\n" "$part" >> "$final_concat"
+done
 
-# Cleanup trap so we can exit cleanly
+output="${abs_input%.*}_up.mp4"
+
+ffmpeg -loglevel error -y \
+  -f concat -safe 0 \
+  -i "$final_concat" \
+  -c copy \
+  "$output" || _die "final concat failed"
+
+_log "✓ done: $output"
+
+_stop_awake
 trap - INT TERM EXIT
-kill "$caf_pid" 2>/dev/null
+
 exit 0

@@ -10,17 +10,17 @@ FFPROBE="${FFPROBE:-ffprobe}"
 LOGO_PATH="${LOGO_PATH:-$HOME/Documents/Prime/logotype.png}"
 
 OUTPUT_FPS="${OUTPUT_FPS:-24}"
-VIDEO_BITRATE="${VIDEO_BITRATE:-1600k}"
-VIDEO_MAXRATE="${VIDEO_MAXRATE:-2000k}"
-VIDEO_BUFSIZE="${VIDEO_BUFSIZE:-4000k}"
+VIDEO_BITRATE="${VIDEO_BITRATE:-1000k}"
+VIDEO_MAXRATE="${VIDEO_MAXRATE:-1300k}"
+VIDEO_BUFSIZE="${VIDEO_BUFSIZE:-2600k}"
 AUDIO_BITRATE="${AUDIO_BITRATE:-96k}"
 
-HLS_TIME="${HLS_TIME:-1}"
+HLS_TIME="${HLS_TIME:-2}"
 HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
 HLS_DELETE_THRESHOLD="${HLS_DELETE_THRESHOLD:-3}"
 
 DEFAULT_MEDIA_DIR="${DEFAULT_MEDIA_DIR:-$HOME/Documents/Will-broadcast/}"
-DEFAULT_SIZE="${DEFAULT_SIZE:-960:540}"
+DEFAULT_SIZE="${DEFAULT_SIZE:-640:360}"
 
 QUOTE_BASE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
 QUOTE_REFRESH_SECONDS="${QUOTE_REFRESH_SECONDS:-15}"
@@ -43,11 +43,107 @@ AD_REQUEST_FILE="${AD_REQUEST_FILE:-/tmp/broadcast-ad-request.txt}"
 AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
 
 SERVER_PID=""
-CHANNELS=()
+QUOTE_PID=""
+AD_PID=""
+CHANNEL_PID=""
+TIMER_PID=""
+ENCODER_PID_FILE="$ROOT_HLS_DIR/encoder.pid"
+BROADCAST_PID_FILE="$ROOT_HLS_DIR/broadcast.pid"
+SLEEP_FILE="${SLEEP_FILE:-/tmp/broadcast-sleep.txt}"
 
 QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
 SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
 STOP_FILE="/tmp/broadcast-stop-$$"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+usage: broadcast [MEDIA_FILE_OR_DIR]
+       broadcast ad SECONDS FILE
+       broadcast sleep MINUTES
+
+With no media argument, plays ~/Documents/Will-broadcast.
+Defaults: 640x360, 24 fps, 2-second HLS segments.
+Set DEFAULT_MEDIA_DIR, DEFAULT_SIZE, OUTPUT_FPS, HLS_TIME, PORT,
+or BIND_ADDR in the environment to override these settings.
+EOF
+  exit 0
+fi
+
+# --- Sleep timer command ---
+if [[ "${1:-}" == "sleep" ]]; then
+  if [[ $# -ne 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+    echo "usage: broadcast sleep MINUTES" >&2
+    exit 2
+  fi
+
+  if [[ ! -s "$BROADCAST_PID_FILE" ]]; then
+    echo "No running broadcast found in $ROOT_HLS_DIR" >&2
+    exit 1
+  fi
+
+  read -r broadcast_pid < "$BROADCAST_PID_FILE"
+  if ! [[ "$broadcast_pid" =~ ^[0-9]+$ ]]; then
+    echo "Invalid broadcast PID file: $BROADCAST_PID_FILE" >&2
+    exit 1
+  fi
+
+  broadcast_is_running() {
+    local command_line
+    command_line="$(ps -p "$broadcast_pid" -o args= 2>/dev/null || true)"
+    [[ "$command_line" =~ (^|[[:space:]/])broadcast([[:space:]]|$) ]]
+  }
+
+  if ! broadcast_is_running; then
+    echo "Broadcast PID $broadcast_pid is no longer running" >&2
+    exit 1
+  fi
+
+  format_remaining() {
+    local total="$1"
+    local days=$((total / 86400))
+    local hours=$(((total % 86400) / 3600))
+    local minutes=$(((total % 3600) / 60))
+    local seconds=$((total % 60))
+    if (( days > 0 )); then
+      printf '%dd %02dh %02dm %02ds' "$days" "$hours" "$minutes" "$seconds"
+    elif (( hours > 0 )); then
+      printf '%dh %02dm %02ds' "$hours" "$minutes" "$seconds"
+    elif (( minutes > 0 )); then
+      printf '%dm %02ds' "$minutes" "$seconds"
+    else
+      printf '%ds' "$seconds"
+    fi
+  }
+
+  trap 'rm -f "$SLEEP_FILE"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  end_epoch=$(( $(date +%s) + 10#$2 * 60 ))
+  last_text=""
+  while (( $(date +%s) < end_epoch )); do
+    if ! broadcast_is_running; then
+      echo "Broadcast stopped before the sleep timer ended" >&2
+      exit 1
+    fi
+    remaining=$((end_epoch - $(date +%s)))
+    if (( remaining <= 60 )); then
+      current_text="sleep $(format_remaining "$remaining")"
+    else
+      current_text="sleep $(((remaining + 59) / 60))m"
+    fi
+    if [[ "$current_text" != "$last_text" ]]; then
+      printf '%s\n' "$current_text" > "$SLEEP_FILE"
+      last_text="$current_text"
+    fi
+    sleep 1
+  done
+
+  if broadcast_is_running; then
+    kill "$broadcast_pid"
+  fi
+  exit 0
+fi
 
 # --- Ad trigger mode ---
 run_ad_command=0
@@ -101,24 +197,15 @@ PY
   exit 0
 fi
 
-if [[ $# -gt 0 ]]; then
-  n=1
-  for input in "$@"; do
-    if [[ ! -e "$input" ]]; then
-      echo "No such file or folder: $input" >&2
-      exit 1
-    fi
+if [[ $# -gt 1 ]]; then
+  echo "usage: broadcast [MEDIA_FILE_OR_DIR]" >&2
+  exit 2
+fi
 
-    if [[ $# -eq 1 ]]; then
-      CHANNELS+=("Prime|Prime|$input|$DEFAULT_SIZE")
-    else
-      CHANNELS+=("Prime$n|Prime $n|$input|$DEFAULT_SIZE")
-    fi
-
-    n=$((n + 1))
-  done
-else
-  CHANNELS+=("Prime|Prime|$DEFAULT_MEDIA_DIR|$DEFAULT_SIZE")
+MEDIA_PATH="${1:-$DEFAULT_MEDIA_DIR}"
+if [[ ! -e "$MEDIA_PATH" ]]; then
+  echo "No such file or folder: $MEDIA_PATH" >&2
+  exit 1
 fi
 
 set_scroll_text() {
@@ -141,22 +228,20 @@ set_break_countdown_text() {
   fi
 }
 
-kill_port_listeners() {
-  local pids=""
-
-  if command -v lsof >/dev/null 2>&1; then
-    pids="$(lsof -ti :"$PORT" 2>/dev/null || true)"
-  elif command -v fuser >/dev/null 2>&1; then
-    pids="$(fuser -n tcp "$PORT" 2>/dev/null || true)"
+kill_encoder() {
+  local pid=""
+  if [[ -s "$ENCODER_PID_FILE" ]]; then
+    read -r pid < "$ENCODER_PID_FILE" || true
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      kill "$pid" 2>/dev/null || true
+      local attempt
+      for attempt in {1..50}; do
+        [[ ! -e "$ENCODER_PID_FILE" ]] && return 0
+        sleep 0.1
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
   fi
-
-  if [[ -n "$pids" ]]; then
-    kill -9 $pids 2>/dev/null || true
-  fi
-}
-
-kill_encoders() {
-  pkill -f "$ROOT_HLS_DIR" 2>/dev/null || true
 }
 
 require_runtime() {
@@ -169,10 +254,6 @@ require_runtime() {
     fi
   done
 
-  if ! command -v lsof >/dev/null 2>&1 && ! command -v fuser >/dev/null 2>&1; then
-    missing+=("lsof or fuser")
-  fi
-
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Missing required app(s): ${missing[*]}" >&2
     exit 1
@@ -184,28 +265,26 @@ require_runtime() {
 }
 
 cleanup() {
+  local status="$1"
   touch "$STOP_FILE"
   echo -e "\n\033[0;31m[!] Cleanup...\033[0m"
 
-  kill_port_listeners
-
-  local pids
-  pids="$(jobs -pr || true)"
-  if [[ -n "$pids" ]]; then
-    kill $pids 2>/dev/null || true
-  fi
-
-  kill_encoders
+  kill_encoder
+  local pid
+  for pid in "$CHANNEL_PID" "$AD_PID" "$QUOTE_PID" "$SERVER_PID" "$TIMER_PID"; do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   rm -rf "$ROOT_HLS_DIR"
 
   rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
   rm -f "$AD_NOW_FILE"
 
   echo "[+] Broadcast stopped."
-  exit 0
+  return "$status"
 }
-trap cleanup EXIT INT TERM
-
 start_server() {
   echo "[*] Starting Web Server on $BIND_ADDR:$PORT..."
   BIND_ADDR="$BIND_ADDR" PORT="$PORT" ROOT_HLS_DIR="$ROOT_HLS_DIR" python3 - >/tmp/broadcast-server.log 2>&1 <<'PY' &
@@ -244,7 +323,11 @@ PY
 }
 
 wait_for_server() {
-  local url="http://127.0.0.1:$PORT/channels.json"
+  local check_addr="$BIND_ADDR"
+  if [[ "$check_addr" == "0.0.0.0" || "$check_addr" == "::" ]]; then
+    check_addr="127.0.0.1"
+  fi
+  local url="http://$check_addr:$PORT/channels.json"
   local i
 
   for i in {1..50}; do
@@ -342,6 +425,7 @@ start_quote_file() {
       sleep 1
     done
   ) &
+  QUOTE_PID="$!"
 }
 
 start_ad_watcher() {
@@ -389,30 +473,22 @@ start_ad_watcher() {
 
       echo -e "\033[0;35m[ad]\033[0m Starting commercial: $ad_path"
 
-      kill_encoders
+      kill_encoder
       sleep 1
     done
   ) &
+  AD_PID="$!"
 }
 
 write_channel_manifest() {
   local manifest="$ROOT_HLS_DIR/channels.json"
 
-  python3 - "$manifest" "${CHANNELS[@]}" <<'PY'
+  python3 - "$manifest" <<'PY'
 import json
 import sys
 
 manifest = sys.argv[1]
-channels = sys.argv[2:]
-out = []
-
-for i, raw in enumerate(channels):
-    name, display_name, _media_path, _size = raw.split("|", 3)
-    out.append({
-        "number": f"{i + 3:02d}",
-        "name": display_name.upper(),
-        "path": f"/{name}/index.m3u8",
-    })
+out = [{"number": "03", "name": "PRIME", "path": "/Prime/index.m3u8"}]
 
 with open(manifest, "w", encoding="utf-8") as f:
     json.dump(out, f, indent=2)
@@ -426,6 +502,7 @@ write_concat_playlist() {
 
   python3 - "$media_path" "$playlist_ffconcat" "$FFPROBE" <<'PY'
 import random
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -435,15 +512,14 @@ playlist = Path(sys.argv[2])
 ffprobe = sys.argv[3]
 exts = {".mp4", ".mkv", ".mov", ".m4v", ".webm"}
 
-def has_video(path):
+def stream_signature(path):
     try:
         r = subprocess.run(
             [
                 ffprobe,
                 "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_type",
-                "-of", "csv=p=0",
+                "-show_entries", "stream=codec_type,codec_name,time_base,width,height,pix_fmt,sample_rate,channels",
+                "-of", "json",
                 str(path),
             ],
             stdout=subprocess.PIPE,
@@ -451,9 +527,21 @@ def has_video(path):
             text=True,
             timeout=8,
         )
-        return r.returncode == 0 and "video" in r.stdout
+        if r.returncode != 0:
+            return None
+        streams = json.loads(r.stdout).get("streams", [])
+        video = next((s for s in streams if s.get("codec_type") == "video"), None)
+        audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
+        if video is None:
+            return None
+        video_keys = ("codec_name", "time_base", "width", "height", "pix_fmt")
+        audio_keys = ("codec_name", "time_base", "sample_rate", "channels")
+        return (
+            tuple(video.get(k) for k in video_keys),
+            tuple(audio.get(k) for k in audio_keys) if audio else None,
+        )
     except Exception:
-        return False
+        return None
 
 if media_path.is_file():
     candidates = [media_path.resolve()]
@@ -468,18 +556,33 @@ else:
 
 good = []
 bad = []
+incompatible = []
+expected_signature = None
 
 for path in candidates:
-    if has_video(path):
+    signature = stream_signature(path)
+    if signature is None:
+        bad.append(path)
+    elif expected_signature is None:
+        expected_signature = signature
+        good.append(path)
+    elif signature == expected_signature:
         good.append(path)
     else:
-        bad.append(path)
+        incompatible.append(path)
 
 good.sort(key=lambda p: str(p).lower())
 random.shuffle(good)
 
 for path in bad:
     print(f"[skip bad media] {path}", file=sys.stderr)
+
+if incompatible:
+    print("Media streams differ; the concat playlist needs matching video and audio formats:", file=sys.stderr)
+    print(f"  reference: {good[0]}", file=sys.stderr)
+    for path in incompatible:
+        print(f"  different: {path}", file=sys.stderr)
+    raise SystemExit(1)
 
 if not good:
     raise SystemExit(f"No playable media files found in {media_path}")
@@ -627,28 +730,31 @@ run_ffmpeg_hls() {
     -hls_flags delete_segments+omit_endlist+program_date_time+independent_segments \
     -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
     -hls_segment_filename "$hls_dir/seg_%d.ts" \
-    "$hls_dir/index.m3u8"
+    "$hls_dir/index.m3u8" &
+
+  local encoder_pid="$!"
+  local status=0
+  printf '%s\n' "$encoder_pid" > "$ENCODER_PID_FILE"
+  wait "$encoder_pid" || status="$?"
+  rm -f "$ENCODER_PID_FILE"
+  return "$status"
 }
 
 start_channel() {
-  local name="$1"
-  local display_name="$2"
-  local media_path="$3"
-  local size="$4"
-  local width="${size%%:*}"
-  local height="${size##*:}"
-  local hls_dir="$ROOT_HLS_DIR/$name"
+  local width="${DEFAULT_SIZE%%:*}"
+  local height="${DEFAULT_SIZE##*:}"
+  local hls_dir="$ROOT_HLS_DIR/Prime"
   local main_playlist="$hls_dir/files.ffconcat"
   local ad_playlist="$hls_dir/ad.ffconcat"
   local v_filter
 
   mkdir -p "$hls_dir"
 
-  write_concat_playlist "$media_path" "$main_playlist"
+  write_concat_playlist "$MEDIA_PATH" "$main_playlist"
   v_filter="$(build_video_filter "$width" "$height")"
 
-  echo -e "\033[0;34m[$display_name]\033[0m Starting channel encoder..."
-  echo "source: $media_path"
+  echo -e "\033[0;34m[Prime]\033[0m Starting channel encoder..."
+  echo "source: $MEDIA_PATH"
 
   (
     while [[ ! -f "$STOP_FILE" ]]; do
@@ -658,7 +764,7 @@ start_channel() {
 
         if [[ -n "$ad_path" && -f "$ad_path" ]]; then
           set_scroll_text "COMMERCIAL BREAK"
-          echo -e "\033[0;35m[$display_name]\033[0m Playing ad: $ad_path"
+          echo -e "\033[0;35m[Prime]\033[0m Playing ad: $ad_path"
 
           if write_single_file_playlist "$ad_path" "$ad_playlist"; then
             run_ffmpeg_hls "$ad_playlist" "$hls_dir" "$v_filter" "once" || true
@@ -667,28 +773,60 @@ start_channel() {
 
         rm -f "$AD_NOW_FILE"
         set_scroll_text "$DEFAULT_SCROLL_TEXT"
-        echo -e "\033[0;35m[$display_name]\033[0m Returning to programming..."
+        echo -e "\033[0;35m[Prime]\033[0m Returning to programming..."
         continue
       fi
 
       run_ffmpeg_hls "$main_playlist" "$hls_dir" "$v_filter" "loop" || true
 
       if [[ ! -f "$STOP_FILE" && ! -f "$AD_NOW_FILE" ]]; then
-        echo -e "\033[0;31m[$display_name]\033[0m Encoder exited. Restarting in 2 seconds..."
+        echo -e "\033[0;31m[Prime]\033[0m Encoder exited. Restarting in 2 seconds..."
         sleep 2
       fi
     done
   ) &
+  CHANNEL_PID="$!"
 }
 
 # --- Execution ---
+if ! [[ "$OUTPUT_FPS" =~ ^[0-9]+$ ]] || (( OUTPUT_FPS < 24 )); then
+  echo "OUTPUT_FPS must be an integer of at least 24" >&2
+  exit 2
+fi
+if ! [[ "$HLS_TIME" =~ ^[0-9]+$ ]] || (( HLS_TIME < 1 )); then
+  echo "HLS_TIME must be a positive integer" >&2
+  exit 2
+fi
 require_runtime
 
-kill_port_listeners
-kill_encoders
+python3 - "$BIND_ADDR" "$PORT" <<'PY'
+import socket
+import sys
+
+address, port = sys.argv[1], int(sys.argv[2])
+family = socket.AF_INET6 if ":" in address else socket.AF_INET
+try:
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind((address, port))
+except OSError as exc:
+    raise SystemExit(f"Cannot bind {address}:{port}: {exc}")
+PY
+
+if [[ -s "$BROADCAST_PID_FILE" ]]; then
+  read -r previous_pid < "$BROADCAST_PID_FILE" || true
+  if [[ "$previous_pid" =~ ^[0-9]+$ ]] && kill -0 "$previous_pid" 2>/dev/null; then
+    echo "Broadcast is already running (PID $previous_pid)" >&2
+    exit 1
+  fi
+fi
 
 rm -rf "$ROOT_HLS_DIR"
 mkdir -p "$ROOT_HLS_DIR"
+printf '%s\n' "$$" > "$BROADCAST_PID_FILE"
+trap 'cleanup $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
 rm -f "$AD_NOW_FILE"
@@ -703,30 +841,22 @@ wait_for_server
 start_quote_file
 start_ad_watcher
 
-for channel in "${CHANNELS[@]}"; do
-  IFS='|' read -r name display_name media_path size <<< "$channel"
-  start_channel "$name" "$display_name" "$media_path" "$size"
-done
+start_channel
 
 echo "[*] Initializing streams..."
 
-for channel in "${CHANNELS[@]}"; do
-  IFS='|' read -r name _ _ _ <<< "$channel"
-  ready=0
-
-  for _ in {1..120}; do
-    if [[ -f "$ROOT_HLS_DIR/$name/index.m3u8" ]]; then
-      ready=1
-      break
-    fi
-    sleep 0.5
-  done
-
-  if [[ "$ready" -ne 1 ]]; then
-    echo "[error] $name never produced index.m3u8" >&2
-    exit 1
+ready=0
+for _ in {1..120}; do
+  if [[ -f "$ROOT_HLS_DIR/Prime/index.m3u8" ]]; then
+    ready=1
+    break
   fi
+  sleep 0.5
 done
+if [[ "$ready" -ne 1 ]]; then
+  echo "[error] Prime never produced index.m3u8" >&2
+  exit 1
+fi
 
 echo -e "\n\033[1;32m------------------------------------------------\033[0m"
 echo -e "\033[1;32m    PRIME BROADCAST LIVE \033[0m"
@@ -735,23 +865,32 @@ echo -e "\033[1;32m------------------------------------------------\033[0m"
 echo -e "\033[1mManifest:\033[0m http://localhost:$PORT/channels.json"
 echo ""
 
-for channel in "${CHANNELS[@]}"; do
-  IFS='|' read -r name display_name media_path _ <<< "$channel"
-  echo -e "\033[1mChannel:\033[0m $display_name"
-  echo "Source: $media_path"
-  echo "http://localhost:$PORT/$name/index.m3u8"
-  echo ""
-done
+echo "Source: $MEDIA_PATH"
+echo "http://localhost:$PORT/Prime/index.m3u8"
+echo ""
 
 echo "Ad trigger:"
 echo "./$(basename "$0") ad 45 /path/to/foo.mp4"
+echo "Sleep timer:"
+echo "./$(basename "$0") sleep 90"
 echo ""
 echo "Press Ctrl+C to stop."
 
-(
-  sleep 604800
-  echo "[!] 7-day limit reached. Stopping broadcast."
-  kill -TERM "$$"
-) &
+sleep 604800 &
+TIMER_PID="$!"
 
-wait
+while kill -0 "$SERVER_PID" 2>/dev/null &&
+      kill -0 "$QUOTE_PID" 2>/dev/null &&
+      kill -0 "$AD_PID" 2>/dev/null &&
+      kill -0 "$CHANNEL_PID" 2>/dev/null &&
+      kill -0 "$TIMER_PID" 2>/dev/null; do
+  sleep 1
+done
+
+if ! kill -0 "$TIMER_PID" 2>/dev/null; then
+  echo "[!] 7-day limit reached. Stopping broadcast."
+  exit 0
+fi
+
+echo "[error] A broadcast process exited unexpectedly." >&2
+exit 1
