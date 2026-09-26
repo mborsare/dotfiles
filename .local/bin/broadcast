@@ -25,8 +25,19 @@ DEFAULT_SIZE="${DEFAULT_SIZE:-960:540}"
 QUOTE_BASE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
 QUOTE_REFRESH_SECONDS="${QUOTE_REFRESH_SECONDS:-15}"
 
-DEFAULT_SCROLL_TEXT="${DEFAULT_SCROLL_TEXT:-DAD CAMP SCHEDULE: Wake-11 free play | 11-12 lunch + mission briefing | 12-5 activity block | 5-7 free time | Hydrate. Hi Sophie!}"
+# Empty means no crawl/ticker.
+DEFAULT_SCROLL_TEXT="${DEFAULT_SCROLL_TEXT:-}"
 SCROLL_SPEED="${SCROLL_SPEED:-95}"
+
+# Bottom bug layout.
+BUG_PAD="${BUG_PAD:-24}"
+BUG_LOGO_WIDTH="${BUG_LOGO_WIDTH:-055}"
+BUG_ROW_BOTTOM="${BUG_ROW_BOTTOM:-58}"
+BUG_FONT_SIZE="${BUG_FONT_SIZE:-22}"
+BUG_BOX_PAD="${BUG_BOX_PAD:-8}"
+TICKER_BOTTOM="${TICKER_BOTTOM:-22}"
+TICKER_FONT_SIZE="${TICKER_FONT_SIZE:-24}"
+TICKER_BOX_PAD="${TICKER_BOX_PAD:-8}"
 
 AD_REQUEST_FILE="${AD_REQUEST_FILE:-/tmp/broadcast-ad-request.txt}"
 AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
@@ -34,12 +45,9 @@ AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
 SERVER_PID=""
 CHANNELS=()
 
-# Keep ffmpeg input/control files outside the HLS output tree. HLS cleanup
-# deletes old segments, and ffmpeg must not lose its concat/control files.
-WORK_DIR="${WORK_DIR:-/tmp/broadcast-work-$$}"
-QUOTE_FILE="$WORK_DIR/quotes.txt"
-SCROLL_FILE="$WORK_DIR/scroll.txt"
-STOP_FILE="$WORK_DIR/stop"
+QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
+SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
+STOP_FILE="/tmp/broadcast-stop-$$"
 
 # --- Ad trigger mode ---
 run_ad_command=0
@@ -113,6 +121,26 @@ else
   CHANNELS+=("Prime|Prime|$DEFAULT_MEDIA_DIR|$DEFAULT_SIZE")
 fi
 
+set_scroll_text() {
+  local text="${1:-}"
+
+  if [[ -n "$text" ]]; then
+    printf "%s\n" "$text" > "$SCROLL_FILE"
+  else
+    : > "$SCROLL_FILE"
+  fi
+}
+
+set_break_countdown_text() {
+  local remaining="$1"
+
+  if [[ -n "$DEFAULT_SCROLL_TEXT" ]]; then
+    set_scroll_text "COMMERCIAL BREAK IN ${remaining}  //  ${DEFAULT_SCROLL_TEXT}"
+  else
+    set_scroll_text "COMMERCIAL BREAK IN ${remaining}"
+  fi
+}
+
 kill_port_listeners() {
   local pids=""
 
@@ -128,32 +156,14 @@ kill_port_listeners() {
 }
 
 kill_encoders() {
-  local pids=""
-  local i
-
-  pids="$(pgrep -f "$ROOT_HLS_DIR" 2>/dev/null || true)"
-  if [[ -z "$pids" ]]; then
-    return 0
-  fi
-
-  kill $pids 2>/dev/null || true
-
-  for i in {1..20}; do
-    pids="$(pgrep -f "$ROOT_HLS_DIR" 2>/dev/null || true)"
-    if [[ -z "$pids" ]]; then
-      return 0
-    fi
-    sleep 0.1
-  done
-
-  kill -9 $pids 2>/dev/null || true
+  pkill -f "$ROOT_HLS_DIR" 2>/dev/null || true
 }
 
 require_runtime() {
   local missing=()
   local cmd
 
-  for cmd in "$FFMPEG" "$FFPROBE" python3 curl pgrep; do
+  for cmd in "$FFMPEG" "$FFPROBE" python3 curl; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
     fi
@@ -174,8 +184,6 @@ require_runtime() {
 }
 
 cleanup() {
-  trap - EXIT INT TERM
-  mkdir -p "$WORK_DIR"
   touch "$STOP_FILE"
   echo -e "\n\033[0;31m[!] Cleanup...\033[0m"
 
@@ -188,8 +196,9 @@ cleanup() {
   fi
 
   kill_encoders
-  rm -rf "$ROOT_HLS_DIR" "$WORK_DIR"
+  rm -rf "$ROOT_HLS_DIR"
 
+  rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
   rm -f "$AD_NOW_FILE"
 
   echo "[+] Broadcast stopped."
@@ -314,16 +323,23 @@ except Exception:
 
 start_quote_file() {
   (
+    local nq_now="-----"
+    local next_quote_refresh=0
+    local now_epoch=""
+    local current_time=""
+
     while [[ ! -f "$STOP_FILE" ]]; do
-      local nq_now="-----"
+      now_epoch="$(date +%s)"
+      current_time="$(date '+%H:%M:%S')"
 
-      nq_now="$(fetch_quote NQ)"
+      if [[ "$now_epoch" -ge "$next_quote_refresh" ]]; then
+        nq_now="$(fetch_quote NQ)"
+        next_quote_refresh=$((now_epoch + QUOTE_REFRESH_SECONDS))
+      fi
 
-      {
-        printf "NQ  %s\n" "$nq_now"
-      } > "$QUOTE_FILE"
+      printf "%s  NQ %s\n" "$current_time" "$nq_now" > "$QUOTE_FILE"
 
-      sleep "$QUOTE_REFRESH_SECONDS"
+      sleep 1
     done
   ) &
 }
@@ -352,14 +368,14 @@ start_ad_watcher() {
       fi
 
       if [[ -z "$ad_path" || ! -f "$ad_path" ]]; then
-        printf "%s\n" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
+        set_scroll_text "$DEFAULT_SCROLL_TEXT"
         continue
       fi
 
       local remaining="$delay"
 
       while [[ "$remaining" -gt 0 && ! -f "$STOP_FILE" ]]; do
-        printf "COMMERCIAL BREAK IN %s  //  %s\n" "$remaining" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
+        set_break_countdown_text "$remaining"
         sleep 1
         remaining=$((remaining - 1))
       done
@@ -369,7 +385,7 @@ start_ad_watcher() {
       fi
 
       printf "%s\n" "$ad_path" > "$AD_NOW_FILE"
-      printf "COMMERCIAL BREAK\n" > "$SCROLL_FILE"
+      set_scroll_text "COMMERCIAL BREAK"
 
       echo -e "\033[0;35m[ad]\033[0m Starting commercial: $ad_path"
 
@@ -503,44 +519,6 @@ with playlist.open("w", encoding="utf-8") as f:
 PY
 }
 
-media_signature() {
-  local media_path="$1"
-
-  python3 - "$media_path" <<'PY'
-import hashlib
-import sys
-from pathlib import Path
-
-media_path = Path(sys.argv[1]).expanduser()
-exts = {".mp4", ".mkv", ".mov", ".m4v", ".webm"}
-h = hashlib.sha256()
-
-if media_path.is_file():
-    paths = [media_path]
-elif media_path.is_dir():
-    paths = sorted(
-        (p for p in media_path.rglob("*") if p.is_file() and p.suffix.lower() in exts),
-        key=lambda p: str(p).lower(),
-    )
-else:
-    raise SystemExit(2)
-
-for path in paths:
-    try:
-        st = path.stat()
-    except FileNotFoundError:
-        continue
-    h.update(str(path.resolve()).encode("utf-8", "surrogateescape"))
-    h.update(b"\0")
-    h.update(str(st.st_size).encode())
-    h.update(b"\0")
-    h.update(str(st.st_mtime_ns).encode())
-    h.update(b"\0")
-
-print(h.hexdigest())
-PY
-}
-
 build_video_filter() {
   local width="$1"
   local height="$2"
@@ -566,52 +544,41 @@ build_video_filter() {
   v_filter+="pad=$width:$height:(ow-iw)/2:(oh-ih)/2,"
   v_filter+="setsar=1,format=yuv420p[main];"
 
+  # Bottom bug row:
+  # [Prime logo]                                [TIME  NQ]
+  # [Ticker optional]
   if [[ -f "$LOGO_PATH" ]]; then
-    v_filter+="movie='$LOGO_PATH',scale=92:-1[logo];"
-    v_filter+="[main][logo]overlay=W-w-24:24[base];"
+    v_filter+="movie='$LOGO_PATH',scale=$BUG_LOGO_WIDTH:-1[logo];"
+    v_filter+="[main][logo]overlay=$BUG_PAD:H-h-$BUG_ROW_BOTTOM[bugbase];"
   else
-    v_filter+="[main]null[base];"
+    v_filter+="[main]null[bugbase];"
   fi
 
-  # Top-left: FFmpeg-rendered local clock, HH:MM:SS.
-  # No textfile helper needed; drawtext updates %{localtime} itself.
-  v_filter+="[base]drawtext="
-  v_filter+="$font_arg"
-  v_filter+="text='%{localtime\:%T}':"
-  v_filter+="x=24:"
-  v_filter+="y=22:"
-  v_filter+="fontsize=24:"
-  v_filter+="fontcolor=white:"
-  v_filter+="box=1:"
-  v_filter+="boxcolor=black@0.50:"
-  v_filter+="boxborderw=8[clocked];"
-
-  # Bottom-left: NQ current quote, lifted above crawl.
-  v_filter+="[clocked]drawtext="
+  # Bottom-right TIME + NQ bug.
+  v_filter+="[bugbase]drawtext="
   v_filter+="$font_arg"
   v_filter+="textfile='$QUOTE_FILE':"
   v_filter+="reload=1:"
-  v_filter+="x=24:"
-  v_filter+="y=H-th-74:"
-  v_filter+="line_spacing=8:"
-  v_filter+="fontsize=22:"
+  v_filter+="x=W-tw-$BUG_PAD:"
+  v_filter+="y=H-th-$BUG_ROW_BOTTOM:"
+  v_filter+="fontsize=$BUG_FONT_SIZE:"
   v_filter+="fontcolor=white:"
   v_filter+="box=1:"
   v_filter+="boxcolor=black@0.50:"
-  v_filter+="boxborderw=10[quoted];"
+  v_filter+="boxborderw=$BUG_BOX_PAD[bugged];"
 
-  # Bottom crawl.
-  v_filter+="[quoted]drawtext="
+  # Bottom ticker/crawl. Empty SCROLL_FILE means no visible ticker.
+  v_filter+="[bugged]drawtext="
   v_filter+="$font_arg"
   v_filter+="textfile='$SCROLL_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=W-mod(t*$SCROLL_SPEED\\,W+tw):"
-  v_filter+="y=H-th-22:"
-  v_filter+="fontsize=24:"
+  v_filter+="y=H-th-$TICKER_BOTTOM:"
+  v_filter+="fontsize=$TICKER_FONT_SIZE:"
   v_filter+="fontcolor=white:"
   v_filter+="box=1:"
   v_filter+="boxcolor=black@0.55:"
-  v_filter+="boxborderw=8"
+  v_filter+="boxborderw=$TICKER_BOX_PAD"
 
   printf "%s" "$v_filter"
 }
@@ -663,43 +630,6 @@ run_ffmpeg_hls() {
     "$hls_dir/index.m3u8"
 }
 
-run_monitored_ffmpeg_hls() {
-  local playlist_ffconcat="$1"
-  local hls_dir="$2"
-  local v_filter="$3"
-  local loop_mode="$4"
-  local media_path="$5"
-  local display_name="$6"
-  local start_signature="${7:-}"
-  local ffmpeg_pid=""
-  local current_signature=""
-
-  run_ffmpeg_hls "$playlist_ffconcat" "$hls_dir" "$v_filter" "$loop_mode" &
-  ffmpeg_pid="$!"
-
-  while kill -0 "$ffmpeg_pid" 2>/dev/null; do
-    if [[ -f "$STOP_FILE" || -s "$AD_NOW_FILE" ]]; then
-      kill "$ffmpeg_pid" 2>/dev/null || true
-      wait "$ffmpeg_pid" 2>/dev/null || true
-      return 0
-    fi
-
-    if [[ "$loop_mode" == "loop" ]]; then
-      current_signature="$(media_signature "$media_path" 2>/dev/null || true)"
-      if [[ -n "$start_signature" && -n "$current_signature" && "$current_signature" != "$start_signature" ]]; then
-        echo -e "\033[0;34m[$display_name]\033[0m Source changed. Restarting encoder..."
-        kill "$ffmpeg_pid" 2>/dev/null || true
-        wait "$ffmpeg_pid" 2>/dev/null || true
-        return 75
-      fi
-    fi
-
-    sleep 2
-  done
-
-  wait "$ffmpeg_pid" 2>/dev/null
-}
-
 start_channel() {
   local name="$1"
   local display_name="$2"
@@ -708,13 +638,13 @@ start_channel() {
   local width="${size%%:*}"
   local height="${size##*:}"
   local hls_dir="$ROOT_HLS_DIR/$name"
-  local channel_work_dir="$WORK_DIR/$name"
-  local main_playlist="$channel_work_dir/files.ffconcat"
-  local ad_playlist="$channel_work_dir/ad.ffconcat"
+  local main_playlist="$hls_dir/files.ffconcat"
+  local ad_playlist="$hls_dir/ad.ffconcat"
   local v_filter
 
-  mkdir -p "$hls_dir" "$channel_work_dir"
+  mkdir -p "$hls_dir"
 
+  write_concat_playlist "$media_path" "$main_playlist"
   v_filter="$(build_video_filter "$width" "$height")"
 
   echo -e "\033[0;34m[$display_name]\033[0m Starting channel encoder..."
@@ -727,7 +657,7 @@ start_channel() {
         ad_path="$(cat "$AD_NOW_FILE" 2>/dev/null || true)"
 
         if [[ -n "$ad_path" && -f "$ad_path" ]]; then
-          printf "COMMERCIAL BREAK\n" > "$SCROLL_FILE"
+          set_scroll_text "COMMERCIAL BREAK"
           echo -e "\033[0;35m[$display_name]\033[0m Playing ad: $ad_path"
 
           if write_single_file_playlist "$ad_path" "$ad_playlist"; then
@@ -736,26 +666,12 @@ start_channel() {
         fi
 
         rm -f "$AD_NOW_FILE"
-        printf "%s\n" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
+        set_scroll_text "$DEFAULT_SCROLL_TEXT"
         echo -e "\033[0;35m[$display_name]\033[0m Returning to programming..."
         continue
       fi
 
-      local start_signature=""
-      start_signature="$(media_signature "$media_path" 2>/dev/null || true)"
-
-      if ! write_concat_playlist "$media_path" "$main_playlist"; then
-        echo -e "\033[0;31m[$display_name]\033[0m Could not build concat playlist. Retrying in 2 seconds..." >&2
-        sleep 2
-        continue
-      fi
-
-      local encoder_status=0
-      run_monitored_ffmpeg_hls "$main_playlist" "$hls_dir" "$v_filter" "loop" "$media_path" "$display_name" "$start_signature" || encoder_status="$?"
-
-      if [[ "$encoder_status" -eq 75 ]]; then
-        continue
-      fi
+      run_ffmpeg_hls "$main_playlist" "$hls_dir" "$v_filter" "loop" || true
 
       if [[ ! -f "$STOP_FILE" && ! -f "$AD_NOW_FILE" ]]; then
         echo -e "\033[0;31m[$display_name]\033[0m Encoder exited. Restarting in 2 seconds..."
@@ -771,13 +687,14 @@ require_runtime
 kill_port_listeners
 kill_encoders
 
-rm -rf "$ROOT_HLS_DIR" "$WORK_DIR"
-mkdir -p "$ROOT_HLS_DIR" "$WORK_DIR"
+rm -rf "$ROOT_HLS_DIR"
+mkdir -p "$ROOT_HLS_DIR"
 
+rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
 rm -f "$AD_NOW_FILE"
 
-printf "-----\n" > "$QUOTE_FILE"
-printf "%s\n" "$DEFAULT_SCROLL_TEXT" > "$SCROLL_FILE"
+printf "%s\n" "$(date '+%H:%M:%S')  NQ -----" > "$QUOTE_FILE"
+set_scroll_text "$DEFAULT_SCROLL_TEXT"
 
 write_channel_manifest
 
@@ -831,12 +748,10 @@ echo "./$(basename "$0") ad 45 /path/to/foo.mp4"
 echo ""
 echo "Press Ctrl+C to stop."
 
-# Stay alive for up to 7 days. Do not use `timeout 604800 wait`:
-# `wait` is a shell builtin, so timeout may fail and trigger cleanup immediately.
-END_TIME=$(( $(date +%s) + 604800 ))
+(
+  sleep 604800
+  echo "[!] 7-day limit reached. Stopping broadcast."
+  kill -TERM "$$"
+) &
 
-while [[ ! -f "$STOP_FILE" && "$(date +%s)" -lt "$END_TIME" ]]; do
-  sleep 5
-done
-
-cleanup
+wait
