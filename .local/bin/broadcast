@@ -546,30 +546,34 @@ def stream_signature(path):
 if media_path.is_file():
     candidates = [media_path.resolve()]
 elif media_path.is_dir():
-    candidates = [
+    candidates = sorted((
         p.resolve()
         for p in media_path.rglob("*")
         if p.is_file() and p.suffix.lower() in exts
-    ]
+    ), key=lambda p: str(p).lower())
 else:
     raise SystemExit(f"No such file or folder: {media_path}")
 
-good = []
 bad = []
-incompatible = []
-expected_signature = None
+groups = {}
 
 for path in candidates:
     signature = stream_signature(path)
     if signature is None:
         bad.append(path)
-    elif expected_signature is None:
-        expected_signature = signature
-        good.append(path)
-    elif signature == expected_signature:
-        good.append(path)
     else:
-        incompatible.append(path)
+        groups.setdefault(signature, []).append(path)
+
+if not groups:
+    for path in bad:
+        print(f"[skip bad media] {path}", file=sys.stderr)
+    raise SystemExit(f"No playable media files found in {media_path}")
+
+# Keep the largest matching set so one unusual file cannot exclude the rest.
+good = max(groups.values(), key=len)
+incompatible = [
+    path for group in groups.values() if group is not good for path in group
+]
 
 good.sort(key=lambda p: str(p).lower())
 random.shuffle(good)
@@ -577,15 +581,10 @@ random.shuffle(good)
 for path in bad:
     print(f"[skip bad media] {path}", file=sys.stderr)
 
-if incompatible:
-    print("Media streams differ; the concat playlist needs matching video and audio formats:", file=sys.stderr)
-    print(f"  reference: {good[0]}", file=sys.stderr)
-    for path in incompatible:
-        print(f"  different: {path}", file=sys.stderr)
-    raise SystemExit(1)
+for path in incompatible:
+    print(f"[skip incompatible media] {path}", file=sys.stderr)
 
-if not good:
-    raise SystemExit(f"No playable media files found in {media_path}")
+print(f"[playlist] {len(good)} playable file(s), {len(bad) + len(incompatible)} skipped", file=sys.stderr)
 
 def ffconcat_quote(path: Path) -> str:
     s = str(path)
