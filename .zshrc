@@ -136,6 +136,7 @@ fi
 
 alias at="$HOME/at.sh"
 alias c='clear'
+alias bins='cd "$HOME/.local/bin"'
 alias day="$HOME/day.sh"
 alias delete='rm -rv'
 alias docs='cd "$HOME/Documents"'
@@ -144,6 +145,7 @@ alias drives='lsblk -f'
 alias edit='nvim'
 alias exe='$HOME/.local/bin/'
 alias ez='${EDITOR:-nvim} ~/.zshrc'
+alias g='git'
 alias ga='git add'
 alias gc='git commit'
 alias gco='git checkout'
