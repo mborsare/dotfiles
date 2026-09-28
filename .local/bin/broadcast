@@ -798,6 +798,24 @@ if ! [[ "$HLS_TIME" =~ ^[0-9]+$ ]] || (( HLS_TIME < 1 )); then
 fi
 require_runtime
 
+# --- Linux stale-listener cleanup ---
+# A previous broadcast can leave the embedded Python HTTP server holding
+# the port after the parent shell exits. Reclaim the port before testing it.
+if command -v fuser >/dev/null 2>&1; then
+  if fuser "$PORT/tcp" >/dev/null 2>&1; then
+    echo "[!] Clearing stale listener on $BIND_ADDR:$PORT..."
+    fuser -k "$PORT/tcp" >/dev/null 2>&1 || true
+
+    # Give the kernel a moment to release the listener.
+    for _ in {1..20}; do
+      if ! fuser "$PORT/tcp" >/dev/null 2>&1; then
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+fi
+
 python3 - "$BIND_ADDR" "$PORT" <<'PY'
 import socket
 import sys
@@ -893,3 +911,4 @@ fi
 
 echo "[error] A broadcast process exited unexpectedly." >&2
 exit 1
+
