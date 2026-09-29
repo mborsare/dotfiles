@@ -19,6 +19,10 @@ HLS_TIME="${HLS_TIME:-2}"
 HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
 HLS_DELETE_THRESHOLD="${HLS_DELETE_THRESHOLD:-3}"
 
+WATCHDOG_GRACE_SECONDS="${WATCHDOG_GRACE_SECONDS:-30}"
+WATCHDOG_STALE_SECONDS="${WATCHDOG_STALE_SECONDS:-20}"
+RESTART_DELAY_SECONDS="${RESTART_DELAY_SECONDS:-2}"
+
 DEFAULT_MEDIA_DIR="${DEFAULT_MEDIA_DIR:-$HOME/Documents/Will-broadcast/}"
 DEFAULT_SIZE="${DEFAULT_SIZE:-640:360}"
 
@@ -317,7 +321,11 @@ class HLSHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-http.server.HTTPServer((BIND_ADDR, PORT), HLSHandler).serve_forever()
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+Server((BIND_ADDR, PORT), HLSHandler).serve_forever()
 PY
   SERVER_PID="$!"
 }
@@ -496,128 +504,43 @@ with open(manifest, "w", encoding="utf-8") as f:
 PY
 }
 
-write_concat_playlist() {
+list_media_files() {
   local media_path="$1"
-  local playlist_ffconcat="$2"
 
-  python3 - "$media_path" "$playlist_ffconcat" "$FFPROBE" <<'PY'
+  python3 - "$media_path" "$FFPROBE" <<'PY'
 import random
-import json
 import subprocess
 import sys
 from pathlib import Path
 
 media_path = Path(sys.argv[1]).expanduser()
-playlist = Path(sys.argv[2])
-ffprobe = sys.argv[3]
+ffprobe = sys.argv[2]
 exts = {".mp4", ".mkv", ".mov", ".m4v", ".webm"}
-
-def stream_signature(path):
-    try:
-        r = subprocess.run(
-            [
-                ffprobe,
-                "-v", "error",
-                "-show_entries", "stream=codec_type,codec_name,time_base,width,height,pix_fmt,sample_rate,channels",
-                "-of", "json",
-                str(path),
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=8,
-        )
-        if r.returncode != 0:
-            return None
-        streams = json.loads(r.stdout).get("streams", [])
-        video = next((s for s in streams if s.get("codec_type") == "video"), None)
-        audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
-        if video is None:
-            return None
-        video_keys = ("codec_name", "time_base", "width", "height", "pix_fmt")
-        audio_keys = ("codec_name", "time_base", "sample_rate", "channels")
-        return (
-            tuple(video.get(k) for k in video_keys),
-            tuple(audio.get(k) for k in audio_keys) if audio else None,
-        )
-    except Exception:
-        return None
 
 if media_path.is_file():
     candidates = [media_path.resolve()]
 elif media_path.is_dir():
-    candidates = sorted((
-        p.resolve()
-        for p in media_path.rglob("*")
-        if p.is_file() and p.suffix.lower() in exts
-    ), key=lambda p: str(p).lower())
+    candidates = sorted((p.resolve() for p in media_path.rglob("*") if p.is_file() and p.suffix.lower() in exts), key=lambda p: str(p).lower())
+    random.shuffle(candidates)
 else:
     raise SystemExit(f"No such file or folder: {media_path}")
 
-bad = []
-groups = {}
-
+good = []
 for path in candidates:
-    signature = stream_signature(path)
-    if signature is None:
-        bad.append(path)
-    else:
-        groups.setdefault(signature, []).append(path)
-
-if not groups:
-    for path in bad:
+    try:
+        r = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8)
+        if r.returncode == 0 and "video" in r.stdout:
+            good.append(path)
+        else:
+            print(f"[skip bad media] {path}", file=sys.stderr)
+    except Exception:
         print(f"[skip bad media] {path}", file=sys.stderr)
+
+if not good:
     raise SystemExit(f"No playable media files found in {media_path}")
 
-# Keep the largest matching set so one unusual file cannot exclude the rest.
-good = max(groups.values(), key=len)
-incompatible = [
-    path for group in groups.values() if group is not good for path in group
-]
-
-good.sort(key=lambda p: str(p).lower())
-random.shuffle(good)
-
-for path in bad:
-    print(f"[skip bad media] {path}", file=sys.stderr)
-
-for path in incompatible:
-    print(f"[skip incompatible media] {path}", file=sys.stderr)
-
-print(f"[playlist] {len(good)} playable file(s), {len(bad) + len(incompatible)} skipped", file=sys.stderr)
-
-def ffconcat_quote(path: Path) -> str:
-    s = str(path)
-    return "'" + s.replace("'", "'\\''") + "'"
-
-with playlist.open("w", encoding="utf-8") as f:
-    f.write("ffconcat version 1.0\n")
-    for path in good:
-        f.write(f"file {ffconcat_quote(path)}\n")
-PY
-}
-
-write_single_file_playlist() {
-  local media_file="$1"
-  local playlist_ffconcat="$2"
-
-  python3 - "$media_file" "$playlist_ffconcat" <<'PY'
-import sys
-from pathlib import Path
-
-media_file = Path(sys.argv[1]).expanduser().resolve()
-playlist = Path(sys.argv[2])
-
-if not media_file.is_file():
-    raise SystemExit(f"No such media file: {media_file}")
-
-def ffconcat_quote(path: Path) -> str:
-    s = str(path)
-    return "'" + s.replace("'", "'\\''") + "'"
-
-with playlist.open("w", encoding="utf-8") as f:
-    f.write("ffconcat version 1.0\n")
-    f.write(f"file {ffconcat_quote(media_file)}\n")
+for path in good:
+    sys.stdout.buffer.write(str(path).encode("utf-8") + b"\0")
 PY
 }
 
@@ -686,11 +609,10 @@ build_video_filter() {
 }
 
 run_ffmpeg_hls() {
-  local playlist_ffconcat="$1"
+  local media_file="$1"
   local hls_dir="$2"
   local v_filter="$3"
   local loop_mode="$4"
-
   local loop_args=()
 
   if [[ "$loop_mode" == "loop" ]]; then
@@ -702,9 +624,7 @@ run_ffmpeg_hls() {
     "${loop_args[@]}" \
     -fflags +genpts+discardcorrupt \
     -err_detect ignore_err \
-    -f concat \
-    -safe 0 \
-    -i "$playlist_ffconcat" \
+    -i "$media_file" \
     -map 0:v:0 \
     -map 0:a? \
     -vf "$v_filter" \
@@ -715,13 +635,14 @@ run_ffmpeg_hls() {
     -maxrate "$VIDEO_MAXRATE" \
     -bufsize "$VIDEO_BUFSIZE" \
     -g "$((OUTPUT_FPS * HLS_TIME))" \
+    -keyint_min "$((OUTPUT_FPS * HLS_TIME))" \
+    -sc_threshold 0 \
     -pix_fmt yuv420p \
     -c:a aac \
     -b:a "$AUDIO_BITRATE" \
     -ar 44100 \
     -ac 2 \
-    -dn \
-    -sn \
+    -dn -sn \
     -f hls \
     -hls_time "$HLS_TIME" \
     -hls_list_size "$HLS_LIST_SIZE" \
@@ -733,8 +654,42 @@ run_ffmpeg_hls() {
 
   local encoder_pid="$!"
   local status=0
+  local watchdog_pid=""
   printf '%s\n' "$encoder_pid" > "$ENCODER_PID_FILE"
+
+  (
+    local started now mtime age
+    started="$(date +%s)"
+    while kill -0 "$encoder_pid" 2>/dev/null && [[ ! -f "$STOP_FILE" ]]; do
+      sleep 5
+      now="$(date +%s)"
+      if (( now - started < WATCHDOG_GRACE_SECONDS )); then
+        continue
+      fi
+      if [[ -f "$hls_dir/index.m3u8" ]]; then
+        mtime="$(stat -c %Y "$hls_dir/index.m3u8" 2>/dev/null || echo 0)"
+        age=$((now - mtime))
+        if (( age > WATCHDOG_STALE_SECONDS )); then
+          echo -e "\033[0;31m[watchdog]\033[0m HLS stale for ${age}s; restarting encoder." >&2
+          kill "$encoder_pid" 2>/dev/null || true
+          sleep 2
+          kill -9 "$encoder_pid" 2>/dev/null || true
+          break
+        fi
+      else
+        echo -e "\033[0;31m[watchdog]\033[0m Encoder produced no HLS after ${WATCHDOG_GRACE_SECONDS}s; restarting." >&2
+        kill "$encoder_pid" 2>/dev/null || true
+        sleep 2
+        kill -9 "$encoder_pid" 2>/dev/null || true
+        break
+      fi
+    done
+  ) &
+  watchdog_pid="$!"
+
   wait "$encoder_pid" || status="$?"
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
   rm -f "$ENCODER_PID_FILE"
   return "$status"
 }
@@ -743,16 +698,12 @@ start_channel() {
   local width="${DEFAULT_SIZE%%:*}"
   local height="${DEFAULT_SIZE##*:}"
   local hls_dir="$ROOT_HLS_DIR/Prime"
-  local main_playlist="$hls_dir/files.ffconcat"
-  local ad_playlist="$hls_dir/ad.ffconcat"
   local v_filter
 
   mkdir -p "$hls_dir"
-
-  write_concat_playlist "$MEDIA_PATH" "$main_playlist"
   v_filter="$(build_video_filter "$width" "$height")"
 
-  echo -e "\033[0;34m[Prime]\033[0m Starting channel encoder..."
+  echo -e "\033[0;34m[Prime]\033[0m Starting channel supervisor..."
   echo "source: $MEDIA_PATH"
 
   (
@@ -760,28 +711,53 @@ start_channel() {
       if [[ -s "$AD_NOW_FILE" ]]; then
         local ad_path=""
         ad_path="$(cat "$AD_NOW_FILE" 2>/dev/null || true)"
-
         if [[ -n "$ad_path" && -f "$ad_path" ]]; then
           set_scroll_text "COMMERCIAL BREAK"
           echo -e "\033[0;35m[Prime]\033[0m Playing ad: $ad_path"
-
-          if write_single_file_playlist "$ad_path" "$ad_playlist"; then
-            run_ffmpeg_hls "$ad_playlist" "$hls_dir" "$v_filter" "once" || true
-          fi
+          run_ffmpeg_hls "$ad_path" "$hls_dir" "$v_filter" "once" || true
         fi
-
         rm -f "$AD_NOW_FILE"
         set_scroll_text "$DEFAULT_SCROLL_TEXT"
         echo -e "\033[0;35m[Prime]\033[0m Returning to programming..."
         continue
       fi
 
-      run_ffmpeg_hls "$main_playlist" "$hls_dir" "$v_filter" "loop" || true
-
-      if [[ ! -f "$STOP_FILE" && ! -f "$AD_NOW_FILE" ]]; then
-        echo -e "\033[0;31m[Prime]\033[0m Encoder exited. Restarting in 2 seconds..."
-        sleep 2
+      if [[ -f "$MEDIA_PATH" ]]; then
+        local status=0
+        run_ffmpeg_hls "$MEDIA_PATH" "$hls_dir" "$v_filter" "loop" || status="$?"
+        [[ -f "$STOP_FILE" ]] && break
+        [[ -s "$AD_NOW_FILE" ]] && continue
+        echo -e "\033[0;31m[Prime]\033[0m Encoder exited (status $status). Restarting in ${RESTART_DELAY_SECONDS}s..."
+        sleep "$RESTART_DELAY_SECONDS"
+        continue
       fi
+
+      local media_files=()
+      if ! mapfile -d '' -t media_files < <(list_media_files "$MEDIA_PATH"); then
+        echo -e "\033[0;31m[Prime]\033[0m Could not build media list. Retrying in 10s..." >&2
+        sleep 10
+        continue
+      fi
+      if (( ${#media_files[@]} == 0 )); then
+        echo -e "\033[0;31m[Prime]\033[0m No playable media. Retrying in 10s..." >&2
+        sleep 10
+        continue
+      fi
+
+      local media_file status
+      for media_file in "${media_files[@]}"; do
+        [[ -f "$STOP_FILE" ]] && break
+        [[ -s "$AD_NOW_FILE" ]] && break
+        echo -e "\033[0;34m[Prime]\033[0m Now playing: $media_file"
+        status=0
+        run_ffmpeg_hls "$media_file" "$hls_dir" "$v_filter" "once" || status="$?"
+        [[ -f "$STOP_FILE" ]] && break
+        [[ -s "$AD_NOW_FILE" ]] && break
+        if (( status != 0 )); then
+          echo -e "\033[0;33m[Prime]\033[0m Media failed (status $status); skipping: $media_file" >&2
+          sleep 1
+        fi
+      done
     done
   ) &
   CHANNEL_PID="$!"
@@ -896,19 +872,26 @@ echo "Press Ctrl+C to stop."
 sleep 604800 &
 TIMER_PID="$!"
 
-while kill -0 "$SERVER_PID" 2>/dev/null &&
-      kill -0 "$QUOTE_PID" 2>/dev/null &&
-      kill -0 "$AD_PID" 2>/dev/null &&
-      kill -0 "$CHANNEL_PID" 2>/dev/null &&
-      kill -0 "$TIMER_PID" 2>/dev/null; do
-  sleep 1
+while kill -0 "$TIMER_PID" 2>/dev/null; do
+  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    echo -e "\033[0;31m[server]\033[0m Web server died; restarting..." >&2
+    start_server
+    wait_for_server
+  fi
+  if ! kill -0 "$QUOTE_PID" 2>/dev/null; then
+    echo -e "\033[0;31m[quotes]\033[0m Quote worker died; restarting..." >&2
+    start_quote_file
+  fi
+  if ! kill -0 "$AD_PID" 2>/dev/null; then
+    echo -e "\033[0;31m[ads]\033[0m Ad watcher died; restarting..." >&2
+    start_ad_watcher
+  fi
+  if ! kill -0 "$CHANNEL_PID" 2>/dev/null; then
+    echo -e "\033[0;31m[Prime]\033[0m Channel supervisor died; restarting..." >&2
+    start_channel
+  fi
+  sleep 2
 done
 
-if ! kill -0 "$TIMER_PID" 2>/dev/null; then
-  echo "[!] 7-day limit reached. Stopping broadcast."
-  exit 0
-fi
-
-echo "[error] A broadcast process exited unexpectedly." >&2
-exit 1
-
+echo "[!] 7-day limit reached. Stopping broadcast."
+exit 0
