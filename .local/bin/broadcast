@@ -509,10 +509,12 @@ list_media_files() {
 
   python3 - "$media_path" "$FFPROBE" <<'PY'
 import random
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 media_path = Path(sys.argv[1]).expanduser()
 ffprobe = sys.argv[2]
 exts = {".mp4", ".mkv", ".mov", ".m4v", ".webm"}
@@ -520,27 +522,26 @@ exts = {".mp4", ".mkv", ".mov", ".m4v", ".webm"}
 if media_path.is_file():
     candidates = [media_path.resolve()]
 elif media_path.is_dir():
-    candidates = sorted((p.resolve() for p in media_path.rglob("*") if p.is_file() and p.suffix.lower() in exts), key=lambda p: str(p).lower())
+    candidates = sorted((p.resolve() for p in media_path.rglob("*") if p.is_file() and p.suffix.lower() in exts and not p.name.startswith("._")), key=lambda p: str(p).lower())
     random.shuffle(candidates)
 else:
     raise SystemExit(f"No such file or folder: {media_path}")
 
-good = []
+good_count = 0
 for path in candidates:
     try:
         r = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=8)
         if r.returncode == 0 and "video" in r.stdout:
-            good.append(path)
+            good_count += 1
+            sys.stdout.buffer.write(str(path).encode("utf-8") + b"\0")
+            sys.stdout.buffer.flush()
         else:
             print(f"[skip bad media] {path}", file=sys.stderr)
     except Exception:
         print(f"[skip bad media] {path}", file=sys.stderr)
 
-if not good:
+if not good_count:
     raise SystemExit(f"No playable media files found in {media_path}")
-
-for path in good:
-    sys.stdout.buffer.write(str(path).encode("utf-8") + b"\0")
 PY
 }
 
@@ -732,20 +733,9 @@ start_channel() {
         continue
       fi
 
-      local media_files=()
-      if ! mapfile -d '' -t media_files < <(list_media_files "$MEDIA_PATH"); then
-        echo -e "\033[0;31m[Prime]\033[0m Could not build media list. Retrying in 10s..." >&2
-        sleep 10
-        continue
-      fi
-      if (( ${#media_files[@]} == 0 )); then
-        echo -e "\033[0;31m[Prime]\033[0m No playable media. Retrying in 10s..." >&2
-        sleep 10
-        continue
-      fi
-
-      local media_file status
-      for media_file in "${media_files[@]}"; do
+      local media_file status media_count=0
+      while IFS= read -r -d '' media_file; do
+        ((media_count+=1))
         [[ -f "$STOP_FILE" ]] && break
         [[ -s "$AD_NOW_FILE" ]] && break
         echo -e "\033[0;34m[Prime]\033[0m Now playing: $media_file"
@@ -757,7 +747,11 @@ start_channel() {
           echo -e "\033[0;33m[Prime]\033[0m Media failed (status $status); skipping: $media_file" >&2
           sleep 1
         fi
-      done
+      done < <(list_media_files "$MEDIA_PATH")
+      if (( media_count == 0 )); then
+        echo -e "\033[0;31m[Prime]\033[0m No playable media. Retrying in 10s..." >&2
+        sleep 10
+      fi
     done
   ) &
   CHANNEL_PID="$!"
