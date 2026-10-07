@@ -27,6 +27,11 @@ WATCHDOG_GRACE_SECONDS="${WATCHDOG_GRACE_SECONDS:-30}"
 WATCHDOG_STALE_SECONDS="${WATCHDOG_STALE_SECONDS:-20}"
 RESTART_DELAY_SECONDS="${RESTART_DELAY_SECONDS:-2}"
 
+REWIND_SECONDS="${REWIND_SECONDS:-10}"
+REWIND_BG_COLOR="${REWIND_BG_COLOR:-0x0000AA}"
+REWIND_LABEL_FONT_SIZE="${REWIND_LABEL_FONT_SIZE:-32}"
+REWIND_TIME_FONT_SIZE="${REWIND_TIME_FONT_SIZE:-24}"
+
 DEFAULT_MEDIA_DIR="${DEFAULT_MEDIA_DIR:-$HOME/Documents/Will-broadcast/}"
 DEFAULT_SIZE="${DEFAULT_SIZE:-640:360}"
 
@@ -62,6 +67,7 @@ BROADCAST_PID_FILE="$ROOT_HLS_DIR/broadcast.pid"
 QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
 NOW_PLAYING_FILE="/tmp/broadcast-now-playing-$$.txt"
 SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
+REWIND_TEXT_FILE="/tmp/broadcast-rewind-$$.txt"
 STOP_FILE="/tmp/broadcast-stop-$$"
 
 
@@ -80,9 +86,10 @@ Defaults:
   640x360
   24 fps
   2-second HLS segments
+  10-second VCR rewind between loops of a single file
 
-Set DEFAULT_MEDIA_DIR, DEFAULT_SIZE, OUTPUT_FPS, HLS_TIME, PORT,
-or BIND_ADDR in the environment to override these settings.
+Set DEFAULT_MEDIA_DIR, DEFAULT_SIZE, OUTPUT_FPS, HLS_TIME, REWIND_SECONDS,
+PORT, or BIND_ADDR in the environment to override these settings.
 EOF
   exit 0
 fi
@@ -389,6 +396,7 @@ cleanup() {
     "$QUOTE_FILE" \
     "$NOW_PLAYING_FILE" \
     "$SCROLL_FILE" \
+    "$REWIND_TEXT_FILE" \
     "$AD_NOW_FILE"
 
   echo "[+] Broadcast stopped."
@@ -890,6 +898,50 @@ build_video_filter() {
 }
 
 
+# Rewind Helpers
+
+probe_media_duration_ms() {
+  local media_file="$1"
+
+  "$FFPROBE" \
+    -v error \
+    -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$media_file" |
+  python3 -c '
+import math
+import sys
+
+try:
+    value = float(sys.stdin.read().strip())
+    if not math.isfinite(value) or value < 0:
+        raise ValueError
+    print(int(round(value * 1000)))
+except Exception:
+    print(0)
+'
+}
+
+format_rewind_time() {
+  local total_ms="$1"
+
+  python3 - "$total_ms" <<'PY'
+import sys
+
+try:
+    total_ms = max(0, int(sys.argv[1]))
+except Exception:
+    total_ms = 0
+
+hours, rem = divmod(total_ms, 3_600_000)
+minutes, rem = divmod(rem, 60_000)
+seconds, millis = divmod(rem, 1_000)
+
+print(f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}")
+PY
+}
+
+
 # HLS Encoder
 
 run_ffmpeg_hls() {
@@ -1020,6 +1072,175 @@ run_ffmpeg_hls() {
 }
 
 
+run_rewind_hls() {
+  local media_file="$1"
+  local hls_dir="$2"
+  local width="$3"
+  local height="$4"
+
+  local duration_ms="0"
+  local font_path=""
+  local font_arg=""
+  local rewind_filter=""
+  local encoder_pid=""
+  local updater_pid=""
+  local status=0
+
+  duration_ms="$(
+    probe_media_duration_ms "$media_file" 2>/dev/null ||
+    echo 0
+  )"
+
+  if ! [[ "$duration_ms" =~ ^[0-9]+$ ]]; then
+    duration_ms="0"
+  fi
+
+  printf '%s\n' \
+    "$(format_rewind_time "$duration_ms")" \
+    > "$REWIND_TEXT_FILE"
+
+  if command -v fc-match >/dev/null 2>&1; then
+    font_path="$(
+      fc-match \
+        -f '%{file}\n' \
+        'ComicShannsMono Nerd Font' \
+        2>/dev/null |
+      head -n 1 ||
+      true
+    )"
+  fi
+
+  if [[ -z "$font_path" || ! -f "$font_path" ]]; then
+    font_path="/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf"
+  fi
+
+  if [[ -f "$font_path" ]]; then
+    font_arg="fontfile='$font_path':"
+  fi
+
+  rewind_filter="drawtext=${font_arg}"
+  rewind_filter+="text='<< Rewind':"
+  rewind_filter+="x=(w-text_w)/2:"
+  rewind_filter+="y=(h/2)-42:"
+  rewind_filter+="fontsize=$REWIND_LABEL_FONT_SIZE:"
+  rewind_filter+="fontcolor=white,"
+  rewind_filter+="drawtext=${font_arg}"
+  rewind_filter+="textfile='$REWIND_TEXT_FILE':"
+  rewind_filter+="reload=1:"
+  rewind_filter+="x=(w-text_w)/2:"
+  rewind_filter+="y=(h/2)+8:"
+  rewind_filter+="fontsize=$REWIND_TIME_FONT_SIZE:"
+  rewind_filter+="fontcolor=white"
+
+  echo -e \
+    "\033[0;34m[Prime]\033[0m << Rewind (${REWIND_SECONDS}s)"
+
+  "$FFMPEG" \
+    -nostdin \
+    -hide_banner \
+    -loglevel warning \
+    -re \
+    -f lavfi \
+    -i "color=c=$REWIND_BG_COLOR:s=${width}x${height}:r=$OUTPUT_FPS" \
+    -re \
+    -f lavfi \
+    -i "anullsrc=r=44100:cl=stereo" \
+    -map 0:v:0 \
+    -map 1:a:0 \
+    -vf "$rewind_filter" \
+    -t "$REWIND_SECONDS" \
+    -c:v libx264 \
+    -preset veryfast \
+    -profile:v main \
+    -b:v "$VIDEO_BITRATE" \
+    -maxrate "$VIDEO_MAXRATE" \
+    -bufsize "$VIDEO_BUFSIZE" \
+    -g "$((OUTPUT_FPS * HLS_TIME))" \
+    -keyint_min "$((OUTPUT_FPS * HLS_TIME))" \
+    -sc_threshold 0 \
+    -pix_fmt yuv420p \
+    -c:a aac \
+    -b:a "$AUDIO_BITRATE" \
+    -ar 44100 \
+    -ac 2 \
+    -f hls \
+    -hls_time "$HLS_TIME" \
+    -hls_list_size "$HLS_LIST_SIZE" \
+    -hls_start_number_source epoch \
+    -hls_flags \
+      delete_segments+omit_endlist+program_date_time+independent_segments \
+    -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
+    -hls_segment_filename "$hls_dir/seg_%d.ts" \
+    "$hls_dir/index.m3u8" &
+
+  encoder_pid="$!"
+  printf '%s\n' "$encoder_pid" > "$ENCODER_PID_FILE"
+
+  python3 - \
+    "$REWIND_TEXT_FILE" \
+    "$duration_ms" \
+    "$REWIND_SECONDS" \
+    "$STOP_FILE" \
+    "$AD_NOW_FILE" <<'PY' &
+import os
+import sys
+import time
+
+text_path = sys.argv[1]
+duration_ms = max(0, int(sys.argv[2]))
+rewind_seconds = max(0.001, float(sys.argv[3]))
+stop_path = sys.argv[4]
+ad_path = sys.argv[5]
+
+
+def format_time(total_ms):
+    total_ms = max(0, int(total_ms))
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    seconds, millis = divmod(rem, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def write_atomic(value):
+    tmp = f"{text_path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(format_time(value) + "\n")
+    os.replace(tmp, text_path)
+
+
+started = time.monotonic()
+write_atomic(duration_ms)
+
+while True:
+    if os.path.exists(stop_path) or os.path.exists(ad_path):
+        break
+
+    elapsed = time.monotonic() - started
+    fraction = min(1.0, elapsed / rewind_seconds)
+    remaining = round(duration_ms * (1.0 - fraction))
+    write_atomic(remaining)
+
+    if fraction >= 1.0:
+        break
+
+    time.sleep(0.025)
+
+write_atomic(0)
+PY
+
+  updater_pid="$!"
+
+  wait "$encoder_pid" || status="$?"
+
+  kill "$updater_pid" 2>/dev/null || true
+  wait "$updater_pid" 2>/dev/null || true
+
+  rm -f "$ENCODER_PID_FILE"
+
+  return "$status"
+}
+
+
 # Channel Supervisor
 
 start_channel() {
@@ -1081,21 +1302,49 @@ start_channel() {
 
       if [[ -f "$MEDIA_PATH" ]]; then
         local status=0
+        local rewind_status=0
+
+        echo -e \
+          "\033[0;34m[Prime]\033[0m Now playing: $MEDIA_PATH"
 
         run_ffmpeg_hls \
           "$MEDIA_PATH" \
           "$hls_dir" \
           "$v_filter" \
-          "loop" ||
+          "once" ||
         status="$?"
 
         [[ -f "$STOP_FILE" ]] && break
         [[ -s "$AD_NOW_FILE" ]] && continue
 
-        echo -e \
-          "\033[0;31m[Prime]\033[0m Encoder exited (status $status). Restarting in ${RESTART_DELAY_SECONDS}s..."
+        if (( status != 0 )); then
+          echo -e \
+            "\033[0;31m[Prime]\033[0m Encoder exited (status $status). Restarting in ${RESTART_DELAY_SECONDS}s..."
 
-        sleep "$RESTART_DELAY_SECONDS"
+          sleep "$RESTART_DELAY_SECONDS"
+          continue
+        fi
+
+        rewind_status=0
+
+        run_rewind_hls \
+          "$MEDIA_PATH" \
+          "$hls_dir" \
+          "$width" \
+          "$height" ||
+        rewind_status="$?"
+
+        [[ -f "$STOP_FILE" ]] && break
+        [[ -s "$AD_NOW_FILE" ]] && continue
+
+        if (( rewind_status != 0 )); then
+          echo -e \
+            "\033[0;33m[Prime]\033[0m Rewind screen exited (status $rewind_status); restarting movie." \
+            >&2
+        else
+          echo -e \
+            "\033[0;34m[Prime]\033[0m Rewind complete. Restarting movie..."
+        fi
 
         continue
       fi
@@ -1166,6 +1415,13 @@ if ! [[ "$HLS_TIME" =~ ^[0-9]+$ ]] ||
    (( HLS_TIME < 1 ))
 then
   echo "HLS_TIME must be a positive integer" >&2
+  exit 2
+fi
+
+if ! [[ "$REWIND_SECONDS" =~ ^[0-9]+$ ]] ||
+   (( REWIND_SECONDS < 1 ))
+then
+  echo "REWIND_SECONDS must be a positive integer" >&2
   exit 2
 fi
 
@@ -1265,6 +1521,7 @@ rm -f \
   "$QUOTE_FILE" \
   "$NOW_PLAYING_FILE" \
   "$SCROLL_FILE" \
+  "$REWIND_TEXT_FILE" \
   "$AD_NOW_FILE"
 
 printf "%s\n" \
