@@ -32,7 +32,7 @@ REWIND_BG_COLOR="${REWIND_BG_COLOR:-0x0000AA}"
 REWIND_LABEL_FONT_SIZE="${REWIND_LABEL_FONT_SIZE:-32}"
 REWIND_TIME_FONT_SIZE="${REWIND_TIME_FONT_SIZE:-24}"
 REWIND_RAMP_FRACTION="${REWIND_RAMP_FRACTION:-0.18}"
-REWIND_GLITCH_SECONDS="${REWIND_GLITCH_SECONDS:-0.22}"
+REWIND_GLITCH_SECONDS="${REWIND_GLITCH_SECONDS:-0.60}"
 REWIND_ZERO_HOLD_SECONDS="${REWIND_ZERO_HOLD_SECONDS:-0.35}"
 PLAY_SCREEN_SECONDS="${PLAY_SCREEN_SECONDS:-1}"
 
@@ -1130,11 +1130,14 @@ run_rewind_hls() {
     font_arg="fontfile='$font_path':"
   fi
 
-  # A tiny burst of grayscale static bridges the movie into the blue VCR slate.
+  # A short, unmistakable analog static burst bridges the movie into the blue VCR slate.
+  # Keep it long enough to survive HLS/player timing, but still feel like a tape glitch.
   # Text stays hidden during the glitch, then the transport screen appears cleanly.
   rewind_filter="noise=alls=100:allf=t+u:"
   rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
-  rewind_filter+="eq=contrast=2.0:brightness=0.05:saturation=0:"
+  rewind_filter+="eq=contrast=2.8:brightness=0.08:saturation=0:"
+  rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
+  rewind_filter+="hue=s=0:"
   rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
   rewind_filter+="drawtext=${font_arg}"
   rewind_filter+="textfile='$REWIND_LABEL_FILE':"
@@ -1232,7 +1235,7 @@ duration_ms = max(0, int(sys.argv[3]))
 try:
     glitch_seconds = max(0.0, float(sys.argv[4]))
 except Exception:
-    glitch_seconds = 0.22
+    glitch_seconds = 0.60
 
 rewind_seconds = max(0.001, float(sys.argv[5]))
 
