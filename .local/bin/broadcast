@@ -7,7 +7,6 @@ BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
 ROOT_HLS_DIR="${ROOT_HLS_DIR:-/tmp/broadcast-hls}"
 FFMPEG="${FFMPEG:-ffmpeg}"
 FFPROBE="${FFPROBE:-ffprobe}"
-LOGO_PATH="${LOGO_PATH:-$HOME/Documents/Prime/logotype.png}"
 
 OUTPUT_FPS="${OUTPUT_FPS:-24}"
 VIDEO_BITRATE="${VIDEO_BITRATE:-1000k}"
@@ -35,7 +34,6 @@ SCROLL_SPEED="${SCROLL_SPEED:-95}"
 
 # Bottom bug layout.
 BUG_PAD="${BUG_PAD:-24}"
-BUG_LOGO_WIDTH="${BUG_LOGO_WIDTH:-055}"
 BUG_ROW_BOTTOM="${BUG_ROW_BOTTOM:-58}"
 BUG_FONT_SIZE="${BUG_FONT_SIZE:-10}"
 BUG_BOX_PAD="${BUG_BOX_PAD:-2}"
@@ -294,10 +292,6 @@ require_runtime() {
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Missing required app(s): ${missing[*]}" >&2
     exit 1
-  fi
-
-  if [[ ! -f "$LOGO_PATH" ]]; then
-    echo "[warn] Logo not found, continuing without logo: $LOGO_PATH" >&2
   fi
 }
 
@@ -608,14 +602,18 @@ build_video_filter() {
   v_filter+="setsar=1,format=yuv420p[main];"
 
   # Bottom bug row:
-  # [Prime logo]                                [TIME  NQ]
+  # [Live]                                      [TIME  NQ]
   # [Ticker optional]
-  if [[ -f "$LOGO_PATH" ]]; then
-    v_filter+="movie='$LOGO_PATH',scale=$BUG_LOGO_WIDTH:-1[logo];"
-    v_filter+="[main][logo]overlay=$BUG_PAD:H-h-$quote_row_bottom[bugbase];"
-  else
-    v_filter+="[main]null[bugbase];"
-  fi
+  v_filter+="[main]drawtext="
+  v_filter+="$font_arg"
+  v_filter+="text='Live':"
+  v_filter+="x=$BUG_PAD:"
+  v_filter+="y=H-th-$quote_row_bottom:"
+  v_filter+="fontsize=$BUG_FONT_SIZE:"
+  v_filter+="fontcolor=white:"
+  v_filter+="box=1:"
+  v_filter+="boxcolor=black@0.50:"
+  v_filter+="boxborderw=$BUG_BOX_PAD[bugbase];"
 
   # Bottom-right TIME + NQ bug.
   v_filter+="[bugbase]drawtext="
