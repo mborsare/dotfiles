@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+
 # Configuration
+
 PORT="${PORT:-8090}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
 ROOT_HLS_DIR="${ROOT_HLS_DIR:-/tmp/broadcast-hls}"
@@ -64,6 +66,7 @@ STOP_FILE="/tmp/broadcast-stop-$$"
 
 
 # Help
+
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
 usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]
@@ -71,20 +74,22 @@ usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]
        broadcast sleep MINUTES
 
 With no media argument, plays ~/Documents/Will-broadcast.
-
-Use:
-  broadcast --now-playing "Wargames"
+Use --now-playing "Wargames" to show a title below the time and NQ quote.
 
 Defaults:
   640x360
   24 fps
   2-second HLS segments
+
+Set DEFAULT_MEDIA_DIR, DEFAULT_SIZE, OUTPUT_FPS, HLS_TIME, PORT,
+or BIND_ADDR in the environment to override these settings.
 EOF
   exit 0
 fi
 
 
 # Sleep Timer
+
 if [[ "${1:-}" == "sleep" ]]; then
   if [[ $# -ne 2 || ! "$2" =~ ^[0-9]+$ ]]; then
     echo "usage: broadcast sleep MINUTES" >&2
@@ -92,26 +97,29 @@ if [[ "${1:-}" == "sleep" ]]; then
   fi
 
   if [[ ! -s "$BROADCAST_PID_FILE" ]]; then
-    echo "No running broadcast found." >&2
+    echo "No running broadcast found in $ROOT_HLS_DIR" >&2
     exit 1
   fi
 
   read -r broadcast_pid < "$BROADCAST_PID_FILE"
 
   if ! [[ "$broadcast_pid" =~ ^[0-9]+$ ]]; then
-    echo "Invalid broadcast PID." >&2
+    echo "Invalid broadcast PID file: $BROADCAST_PID_FILE" >&2
     exit 1
   fi
 
   broadcast_is_running() {
     local command_line
 
-    command_line="$(
-      ps -p "$broadcast_pid" -o args= 2>/dev/null || true
-    )"
+    command_line="$(ps -p "$broadcast_pid" -o args= 2>/dev/null || true)"
 
     [[ "$command_line" =~ (^|[[:space:]/])broadcast([[:space:]]|$) ]]
   }
+
+  if ! broadcast_is_running; then
+    echo "Broadcast PID $broadcast_pid is no longer running" >&2
+    exit 1
+  fi
 
   format_remaining() {
     local total="$1"
@@ -134,11 +142,6 @@ if [[ "${1:-}" == "sleep" ]]; then
     fi
   }
 
-  if ! broadcast_is_running; then
-    echo "Broadcast is no longer running." >&2
-    exit 1
-  fi
-
   trap 'rm -f "$SLEEP_FILE"' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -148,7 +151,7 @@ if [[ "${1:-}" == "sleep" ]]; then
 
   while (( $(date +%s) < end_epoch )); do
     if ! broadcast_is_running; then
-      echo "Broadcast stopped before sleep timer ended." >&2
+      echo "Broadcast stopped before the sleep timer ended" >&2
       exit 1
     fi
 
@@ -177,6 +180,7 @@ fi
 
 
 # Ad Trigger
+
 run_ad_command=0
 
 if [[ "$(basename "$0")" == "broadcastad" ]]; then
@@ -199,7 +203,7 @@ if [[ "$run_ad_command" -eq 1 ]]; then
   ad_file="$2"
 
   if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
-    echo "Delay must be seconds." >&2
+    echo "Delay must be seconds, like: 45" >&2
     exit 1
   fi
 
@@ -226,11 +230,13 @@ PY
   mv "$tmp" "$AD_REQUEST_FILE"
 
   echo "Ad queued: break in ${delay}s -> $ad_path"
+
   exit 0
 fi
 
 
 # Arguments
+
 NOW_PLAYING_TITLE=""
 MEDIA_PATH=""
 
@@ -284,6 +290,7 @@ fi
 
 
 # Helpers
+
 set_scroll_text() {
   local text="${1:-}"
 
@@ -298,44 +305,36 @@ set_break_countdown_text() {
   local remaining="$1"
 
   if [[ -n "$DEFAULT_SCROLL_TEXT" ]]; then
-    set_scroll_text \
-      "COMMERCIAL BREAK IN ${remaining}  //  ${DEFAULT_SCROLL_TEXT}"
+    set_scroll_text "COMMERCIAL BREAK IN ${remaining}  //  ${DEFAULT_SCROLL_TEXT}"
   else
-    set_scroll_text \
-      "COMMERCIAL BREAK IN ${remaining}"
+    set_scroll_text "COMMERCIAL BREAK IN ${remaining}"
   fi
 }
 
 kill_encoder() {
   local pid=""
 
-  if [[ ! -s "$ENCODER_PID_FILE" ]]; then
-    return 0
-  fi
+  if [[ -s "$ENCODER_PID_FILE" ]]; then
+    read -r pid < "$ENCODER_PID_FILE" || true
 
-  read -r pid < "$ENCODER_PID_FILE" || true
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      kill "$pid" 2>/dev/null || true
 
-  if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
-    return 0
-  fi
+      local attempt
 
-  kill "$pid" 2>/dev/null || true
+      for attempt in {1..50}; do
+        [[ ! -e "$ENCODER_PID_FILE" ]] && return 0
+        sleep 0.1
+      done
 
-  local attempt
-
-  for attempt in {1..50}; do
-    if [[ ! -e "$ENCODER_PID_FILE" ]]; then
-      return 0
+      kill -9 "$pid" 2>/dev/null || true
     fi
-
-    sleep 0.1
-  done
-
-  kill -9 "$pid" 2>/dev/null || true
+  fi
 }
 
 
-# Runtime Checks
+# Runtime
+
 require_runtime() {
   local missing=()
   local cmd
@@ -352,12 +351,13 @@ require_runtime() {
   fi
 
   if [[ ! -f "$LOGO_PATH" ]]; then
-    echo "[warn] Logo not found: $LOGO_PATH" >&2
+    echo "[warn] Logo not found, continuing without logo: $LOGO_PATH" >&2
   fi
 }
 
 
 # Cleanup
+
 cleanup() {
   local status="$1"
 
@@ -398,6 +398,7 @@ cleanup() {
 
 
 # Web Server
+
 start_server() {
   echo "[*] Starting Web Server on $BIND_ADDR:$PORT..."
 
@@ -479,11 +480,13 @@ wait_for_server() {
 
   echo "[error] Web server did not become reachable at $url" >&2
   cat /tmp/broadcast-server.log >&2 2>/dev/null || true
+
   exit 1
 }
 
 
 # Quotes
+
 fetch_quote() {
   local symbol="$1"
   local url="$QUOTE_BASE_URL/$symbol"
@@ -569,9 +572,7 @@ start_quote_file() {
 
       if [[ "$now_epoch" -ge "$next_quote_refresh" ]]; then
         nq_now="$(fetch_quote NQ)"
-        next_quote_refresh=$(
-          (now_epoch + QUOTE_REFRESH_SECONDS)
-        )
+        next_quote_refresh=$((now_epoch + QUOTE_REFRESH_SECONDS))
       fi
 
       printf "%s  NQ %s\n" \
@@ -588,6 +589,7 @@ start_quote_file() {
 
 
 # Commercial Breaks
+
 start_ad_watcher() {
   (
     while [[ ! -f "$STOP_FILE" ]]; do
@@ -604,9 +606,7 @@ start_ad_watcher() {
       local delay=""
       local ad_path=""
 
-      IFS=$'\t' read -r delay ad_path \
-        < "$AD_REQUEST_FILE" || true
-
+      IFS=$'\t' read -r delay ad_path < "$AD_REQUEST_FILE" || true
       rm -f "$AD_REQUEST_FILE"
 
       if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
@@ -620,9 +620,7 @@ start_ad_watcher() {
 
       local remaining="$delay"
 
-      while [[ "$remaining" -gt 0 &&
-               ! -f "$STOP_FILE" ]]
-      do
+      while [[ "$remaining" -gt 0 && ! -f "$STOP_FILE" ]]; do
         set_break_countdown_text "$remaining"
 
         sleep 1
@@ -652,6 +650,7 @@ start_ad_watcher() {
 
 
 # Channel Manifest
+
 write_channel_manifest() {
   local manifest="$ROOT_HLS_DIR/channels.json"
 
@@ -677,6 +676,7 @@ PY
 
 
 # Media Discovery
+
 list_media_files() {
   local media_path="$1"
 
@@ -780,7 +780,8 @@ PY
 }
 
 
-# Video Overlay
+# Video Filter
+
 build_video_filter() {
   local width="$1"
   local height="$2"
@@ -793,10 +794,7 @@ build_video_filter() {
   local quote_output="bugged"
 
   if [[ -n "$NOW_PLAYING_TITLE" ]]; then
-    quote_row_bottom=$(
-      (BUG_ROW_BOTTOM + BUG_FONT_SIZE + 6)
-    )
-
+    quote_row_bottom=$((BUG_ROW_BOTTOM + BUG_FONT_SIZE + 6))
     quote_output="quoted"
   fi
 
@@ -829,6 +827,7 @@ build_video_filter() {
   v_filter+="format=yuv420p[main];"
 
   # Logo
+
   if [[ -f "$LOGO_PATH" ]]; then
     v_filter+="movie='$LOGO_PATH',"
     v_filter+="scale=$BUG_LOGO_WIDTH:-1[logo];"
@@ -843,6 +842,7 @@ build_video_filter() {
   fi
 
   # Time And NQ
+
   v_filter+="[bugbase]drawtext="
   v_filter+="$font_arg"
   v_filter+="textfile='$QUOTE_FILE':"
@@ -857,6 +857,7 @@ build_video_filter() {
   v_filter+="[$quote_output];"
 
   # Now Playing
+
   if [[ -n "$NOW_PLAYING_TITLE" ]]; then
     v_filter+="[quoted]drawtext="
     v_filter+="$font_arg"
@@ -872,6 +873,7 @@ build_video_filter() {
   fi
 
   # Ticker
+
   v_filter+="[bugged]drawtext="
   v_filter+="$font_arg"
   v_filter+="textfile='$SCROLL_FILE':"
@@ -889,6 +891,7 @@ build_video_filter() {
 
 
 # HLS Encoder
+
 run_ffmpeg_hls() {
   local media_file="$1"
   local hls_dir="$2"
@@ -1018,6 +1021,7 @@ run_ffmpeg_hls() {
 
 
 # Channel Supervisor
+
 start_channel() {
   local width="${DEFAULT_SIZE%%:*}"
   local height="${DEFAULT_SIZE##*:}"
@@ -1041,6 +1045,7 @@ start_channel() {
     while [[ ! -f "$STOP_FILE" ]]; do
 
       # Commercial
+
       if [[ -s "$AD_NOW_FILE" ]]; then
         local ad_path=""
 
@@ -1073,6 +1078,7 @@ start_channel() {
       fi
 
       # Single File
+
       if [[ -f "$MEDIA_PATH" ]]; then
         local status=0
 
@@ -1095,6 +1101,7 @@ start_channel() {
       fi
 
       # Media Folder
+
       local media_file=""
       local status=0
       local media_count=0
@@ -1146,7 +1153,8 @@ start_channel() {
 }
 
 
-# Startup Checks
+# Validation
+
 if ! [[ "$OUTPUT_FPS" =~ ^[0-9]+$ ]] ||
    (( OUTPUT_FPS < 24 ))
 then
@@ -1165,6 +1173,7 @@ require_runtime
 
 
 # Port Cleanup
+
 if command -v fuser >/dev/null 2>&1; then
   if fuser "$PORT/tcp" >/dev/null 2>&1; then
     echo "[!] Clearing stale listener on $BIND_ADDR:$PORT..."
@@ -1183,6 +1192,7 @@ fi
 
 
 # Port Check
+
 python3 - "$BIND_ADDR" "$PORT" <<'PY'
 import socket
 import sys
@@ -1222,6 +1232,7 @@ PY
 
 
 # Existing Broadcast
+
 if [[ -s "$BROADCAST_PID_FILE" ]]; then
   read -r previous_pid \
     < "$BROADCAST_PID_FILE" || true
@@ -1239,6 +1250,7 @@ fi
 
 
 # Working Directory
+
 rm -rf "$ROOT_HLS_DIR"
 mkdir -p "$ROOT_HLS_DIR"
 
@@ -1269,6 +1281,7 @@ set_scroll_text "$DEFAULT_SCROLL_TEXT"
 
 
 # Start Services
+
 write_channel_manifest
 
 start_server
@@ -1280,6 +1293,7 @@ start_channel
 
 
 # Wait For Stream
+
 echo "[*] Initializing streams..."
 
 ready=0
@@ -1303,6 +1317,7 @@ fi
 
 
 # Live
+
 echo -e \
   "\n\033[1;32m------------------------------------------------\033[0m"
 
@@ -1333,6 +1348,7 @@ echo "Press Ctrl+C to stop."
 
 
 # Main Loop
+
 sleep 604800 &
 TIMER_PID="$!"
 
@@ -1376,6 +1392,7 @@ done
 
 
 # Shutdown
+
 echo "[!] 7-day limit reached. Stopping broadcast."
 
 exit 0
