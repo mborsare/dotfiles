@@ -56,28 +56,28 @@ resolve_destination() {
     cloud)
       # One canonical cloud drop.
       # ~/cloud on oldbook is a symlink to the mount.
-      DEST_HOST="oldbook.prime"
+      DEST_HOST="oldbook"
       DEST_USER="mikeb"
       DEST_DIR="cloud"
       ;;
 
     oldbook)
       # The oldbook machine itself.
-      DEST_HOST="oldbook.prime"
+      DEST_HOST="oldbook"
       DEST_USER="mikeb"
       DEST_DIR="incoming"
       ;;
 
     primebook)
       # The primebook machine itself.
-      DEST_HOST="primebook.prime"
+      DEST_HOST="primebook"
       DEST_USER="mikeb"
       DEST_DIR="incoming"
       ;;
 
     morningbrief)
       # Morning assets are made on oldbook and pushed to primebook.
-      DEST_HOST="primebook.prime"
+      DEST_HOST="primebook"
       DEST_USER="mikeb"
       DEST_DIR="cloud/morningbrief"
       ;;

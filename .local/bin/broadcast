@@ -56,16 +56,18 @@ BROADCAST_PID_FILE="$ROOT_HLS_DIR/broadcast.pid"
 SLEEP_FILE="${SLEEP_FILE:-/tmp/broadcast-sleep.txt}"
 
 QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
+NOW_PLAYING_FILE="/tmp/broadcast-now-playing-$$.txt"
 SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
 STOP_FILE="/tmp/broadcast-stop-$$"
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   cat <<'EOF'
-usage: broadcast [MEDIA_FILE_OR_DIR]
+usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]
        broadcast ad SECONDS FILE
        broadcast sleep MINUTES
 
 With no media argument, plays ~/Documents/Will-broadcast.
+Use --now-playing "Wargames" to show a title below the time and NQ quote.
 Defaults: 640x360, 24 fps, 2-second HLS segments.
 Set DEFAULT_MEDIA_DIR, DEFAULT_SIZE, OUTPUT_FPS, HLS_TIME, PORT,
 or BIND_ADDR in the environment to override these settings.
@@ -201,12 +203,43 @@ PY
   exit 0
 fi
 
-if [[ $# -gt 1 ]]; then
-  echo "usage: broadcast [MEDIA_FILE_OR_DIR]" >&2
-  exit 2
-fi
+NOW_PLAYING_TITLE=""
+MEDIA_PATH=""
+while (( $# > 0 )); do
+  case "$1" in
+    --now-playing)
+      if (( $# < 2 )); then
+        echo "--now-playing requires a title" >&2
+        exit 2
+      fi
+      NOW_PLAYING_TITLE="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      if (( $# != 1 )) || [[ -n "$MEDIA_PATH" ]]; then
+        echo "usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]" >&2
+        exit 2
+      fi
+      MEDIA_PATH="$1"
+      shift
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "$MEDIA_PATH" ]]; then
+        echo "usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]" >&2
+        exit 2
+      fi
+      MEDIA_PATH="$1"
+      shift
+      ;;
+  esac
+done
 
-MEDIA_PATH="${1:-$DEFAULT_MEDIA_DIR}"
+MEDIA_PATH="${MEDIA_PATH:-$DEFAULT_MEDIA_DIR}"
 if [[ ! -e "$MEDIA_PATH" ]]; then
   echo "No such file or folder: $MEDIA_PATH" >&2
   exit 1
@@ -283,7 +316,7 @@ cleanup() {
   done
   rm -rf "$ROOT_HLS_DIR"
 
-  rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
+  rm -f "$STOP_FILE" "$QUOTE_FILE" "$NOW_PLAYING_FILE" "$SCROLL_FILE"
   rm -f "$AD_NOW_FILE"
 
   echo "[+] Broadcast stopped."
@@ -397,10 +430,7 @@ try:
     if not math.isfinite(value):
         raise ValueError("bad price")
 
-    if abs(value - round(value)) < 0.001:
-        print(str(int(round(value))))
-    else:
-        print((f"{value:.2f}").rstrip("0").rstrip("."))
+    print(str(math.trunc(value)))
 except Exception:
     print("-----")
 ' 2>/dev/null || true)"
@@ -421,7 +451,7 @@ start_quote_file() {
 
     while [[ ! -f "$STOP_FILE" ]]; do
       now_epoch="$(date +%s)"
-      current_time="$(date '+%H:%M:%S')"
+      current_time="$(date '+%H:%M')"
 
       if [[ "$now_epoch" -ge "$next_quote_refresh" ]]; then
         nq_now="$(fetch_quote NQ)"
@@ -551,6 +581,13 @@ build_video_filter() {
   local font_path=""
   local font_arg=""
   local v_filter=""
+  local quote_row_bottom="$BUG_ROW_BOTTOM"
+  local quote_output="bugged"
+
+  if [[ -n "$NOW_PLAYING_TITLE" ]]; then
+    quote_row_bottom=$((BUG_ROW_BOTTOM + BUG_FONT_SIZE + 6))
+    quote_output="quoted"
+  fi
 
   if command -v fc-match >/dev/null 2>&1; then
     font_path="$(fc-match -f '%{file}\n' 'ComicShannsMono Nerd Font' 2>/dev/null | head -n 1 || true)"
@@ -575,7 +612,7 @@ build_video_filter() {
   # [Ticker optional]
   if [[ -f "$LOGO_PATH" ]]; then
     v_filter+="movie='$LOGO_PATH',scale=$BUG_LOGO_WIDTH:-1[logo];"
-    v_filter+="[main][logo]overlay=$BUG_PAD:H-h-$BUG_ROW_BOTTOM[bugbase];"
+    v_filter+="[main][logo]overlay=$BUG_PAD:H-h-$quote_row_bottom[bugbase];"
   else
     v_filter+="[main]null[bugbase];"
   fi
@@ -586,12 +623,25 @@ build_video_filter() {
   v_filter+="textfile='$QUOTE_FILE':"
   v_filter+="reload=1:"
   v_filter+="x=W-tw-$BUG_PAD:"
-  v_filter+="y=H-th-$BUG_ROW_BOTTOM:"
+  v_filter+="y=H-th-$quote_row_bottom:"
   v_filter+="fontsize=$BUG_FONT_SIZE:"
   v_filter+="fontcolor=white:"
   v_filter+="box=1:"
   v_filter+="boxcolor=black@0.50:"
-  v_filter+="boxborderw=$BUG_BOX_PAD[bugged];"
+  v_filter+="boxborderw=$BUG_BOX_PAD[$quote_output];"
+
+  if [[ -n "$NOW_PLAYING_TITLE" ]]; then
+    v_filter+="[quoted]drawtext="
+    v_filter+="$font_arg"
+    v_filter+="textfile='$NOW_PLAYING_FILE':"
+    v_filter+="x=W-tw-$BUG_PAD:"
+    v_filter+="y=H-th-$BUG_ROW_BOTTOM:"
+    v_filter+="fontsize=$BUG_FONT_SIZE:"
+    v_filter+="fontcolor=white:"
+    v_filter+="box=1:"
+    v_filter+="boxcolor=black@0.50:"
+    v_filter+="boxborderw=$BUG_BOX_PAD[bugged];"
+  fi
 
   # Bottom ticker/crawl. Empty SCROLL_FILE means no visible ticker.
   v_filter+="[bugged]drawtext="
@@ -815,10 +865,13 @@ trap 'cleanup $?' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-rm -f "$STOP_FILE" "$QUOTE_FILE" "$SCROLL_FILE"
+rm -f "$STOP_FILE" "$QUOTE_FILE" "$NOW_PLAYING_FILE" "$SCROLL_FILE"
 rm -f "$AD_NOW_FILE"
 
-printf "%s\n" "$(date '+%H:%M:%S')  NQ -----" > "$QUOTE_FILE"
+printf "%s\n" "$(date '+%H:%M')  NQ -----" > "$QUOTE_FILE"
+if [[ -n "$NOW_PLAYING_TITLE" ]]; then
+  printf 'Now playing: %s\n' "${NOW_PLAYING_TITLE//$'\n'/ }" > "$NOW_PLAYING_FILE"
+fi
 set_scroll_text "$DEFAULT_SCROLL_TEXT"
 
 write_channel_manifest
