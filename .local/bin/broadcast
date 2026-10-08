@@ -1,144 +1,1085 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Configuration Defaults
 
-PORT="${PORT:-8080}"
-BIND_ADDR="${BIND_ADDR:-0.0.0.0}"
-ROOT_HLS_DIR="${ROOT_HLS_DIR:-/tmp/vhs_hls}"
-MEDIA_PATH="${MEDIA_PATH:-./media}"
-ADS_DIR="${ADS_DIR:-./ads}"
-QUOTES_FILE="${QUOTES_FILE:-./quotes.txt}"
+# Configuration
+
+PORT="${PORT:-8090}"
+BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
+ROOT_HLS_DIR="${ROOT_HLS_DIR:-/tmp/broadcast-hls}"
+
+FFMPEG="${FFMPEG:-ffmpeg}"
+FFPROBE="${FFPROBE:-ffprobe}"
+
+LOGO_PATH="${LOGO_PATH:-$HOME/Documents/Prime/logotype.png}"
+
+OUTPUT_FPS="${OUTPUT_FPS:-24}"
+VIDEO_BITRATE="${VIDEO_BITRATE:-1000k}"
+VIDEO_MAXRATE="${VIDEO_MAXRATE:-1300k}"
+VIDEO_BUFSIZE="${VIDEO_BUFSIZE:-2600k}"
+AUDIO_BITRATE="${AUDIO_BITRATE:-96k}"
+
+HLS_TIME="${HLS_TIME:-2}"
+HLS_LIST_SIZE="${HLS_LIST_SIZE:-6}"
+HLS_DELETE_THRESHOLD="${HLS_DELETE_THRESHOLD:-3}"
+
+WATCHDOG_GRACE_SECONDS="${WATCHDOG_GRACE_SECONDS:-30}"
+WATCHDOG_STALE_SECONDS="${WATCHDOG_STALE_SECONDS:-20}"
 RESTART_DELAY_SECONDS="${RESTART_DELAY_SECONDS:-2}"
-DEFAULT_SCROLL_TEXT="${DEFAULT_SCROLL_TEXT:-LATE NIGHT BROADCAST /// RETRO CRT SIMULATION /// DIRECT-TO-TAPE STREAMING}"
-NOW_PLAYING_TITLE=""
 
-# State Files & Runtime Directories
+REWIND_SECONDS="${REWIND_SECONDS:-10}"
+REWIND_BG_COLOR="${REWIND_BG_COLOR:-0x0000AA}"
+REWIND_LABEL_FONT_SIZE="${REWIND_LABEL_FONT_SIZE:-32}"
+REWIND_TIME_FONT_SIZE="${REWIND_TIME_FONT_SIZE:-24}"
+REWIND_RAMP_FRACTION="${REWIND_RAMP_FRACTION:-0.18}"
+REWIND_GLITCH_SECONDS="${REWIND_GLITCH_SECONDS:-0.60}"
+REWIND_ZERO_HOLD_SECONDS="${REWIND_ZERO_HOLD_SECONDS:-0.35}"
+PLAY_SCREEN_SECONDS="${PLAY_SCREEN_SECONDS:-1}"
 
-CONTROL_DIR="${ROOT_HLS_DIR}/control"
-STOP_FILE="${CONTROL_DIR}/stop"
-SCROLL_TEXT_FILE="${CONTROL_DIR}/scroll_text.txt"
-NOW_PLAYING_FILE="${CONTROL_DIR}/now_playing.txt"
-AD_NOW_FILE="${CONTROL_DIR}/play_ad_now"
-BROADCAST_PID_FILE="${CONTROL_DIR}/broadcast.pid"
+DEFAULT_MEDIA_DIR="${DEFAULT_MEDIA_DIR:-$HOME/Documents/Will-broadcast/}"
+DEFAULT_SIZE="${DEFAULT_SIZE:-640:360}"
+
+QUOTE_BASE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
+QUOTE_REFRESH_SECONDS="${QUOTE_REFRESH_SECONDS:-15}"
+
+DEFAULT_SCROLL_TEXT="${DEFAULT_SCROLL_TEXT:-}"
+SCROLL_SPEED="${SCROLL_SPEED:-95}"
+
+BUG_LOGO_WIDTH="${BUG_LOGO_WIDTH:-55}"
+BUG_PAD="${BUG_PAD:-24}"
+BUG_ROW_BOTTOM="${BUG_ROW_BOTTOM:-58}"
+BUG_FONT_SIZE="${BUG_FONT_SIZE:-10}"
+BUG_BOX_PAD="${BUG_BOX_PAD:-2}"
+
+TICKER_BOTTOM="${TICKER_BOTTOM:-22}"
+TICKER_FONT_SIZE="${TICKER_FONT_SIZE:-24}"
+TICKER_BOX_PAD="${TICKER_BOX_PAD:-8}"
+
+AD_REQUEST_FILE="${AD_REQUEST_FILE:-/tmp/broadcast-ad-request.txt}"
+AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
+SLEEP_FILE="${SLEEP_FILE:-/tmp/broadcast-sleep.txt}"
 
 SERVER_PID=""
 QUOTE_PID=""
-AD_WATCHER_PID=""
+AD_PID=""
 CHANNEL_PID=""
+TIMER_PID=""
 
-# Helper Functions
+ENCODER_PID_FILE="$ROOT_HLS_DIR/encoder.pid"
+BROADCAST_PID_FILE="$ROOT_HLS_DIR/broadcast.pid"
 
-log_info() {
-  echo -e "\033[0;32m[INFO]\033[0m $*"
-}
+QUOTE_FILE="/tmp/broadcast-quotes-$$.txt"
+NOW_PLAYING_FILE="/tmp/broadcast-now-playing-$$.txt"
+SCROLL_FILE="/tmp/broadcast-scroll-$$.txt"
+REWIND_LABEL_FILE="/tmp/broadcast-rewind-label-$$.txt"
+REWIND_TEXT_FILE="/tmp/broadcast-rewind-time-$$.txt"
+STOP_FILE="/tmp/broadcast-stop-$$"
 
-log_warn() {
-  echo -e "\033[0;33m[WARN]\033[0m $*"
-}
 
-log_err() {
-  echo -e "\033[0;31m[ERROR]\033[0m $*"
-}
+# Help
 
-parse_cli_args() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --now-playing)
-        if [[ -n "${2:-}" ]]; then
-          NOW_PLAYING_TITLE="$2"
-          shift 2
-        else
-          log_err "Option --now-playing requires an argument."
-          exit 1
-        fi
-        ;;
-      -p|--port)
-        PORT="$2"
-        shift 2
-        ;;
-      -*)
-        log_err "Unknown option: $1"
-        exit 1
-        ;;
-      *)
-        MEDIA_PATH="$1"
-        shift
-        ;;
-    esac
-  done
-}
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]
+       broadcast ad SECONDS FILE
+       broadcast sleep MINUTES
 
-require_runtime() {
-  local cmds=("ffmpeg" "ffprobe" "python3")
-  for cmd in "${cmds[@]}"; do
-    if ! command -v "$cmd" &>/dev/null; then
-      log_err "Required command missing: $cmd"
+With no media argument, plays ~/Documents/Will-broadcast.
+Use --now-playing "Wargames" to show a title below the time and NQ quote.
+
+Defaults:
+  640x360
+  24 fps
+  2-second HLS segments
+  brief analog glitch when a single movie ends
+  10-second VCR rewind between loops of a single file
+  brief hold on 00:00:00.000, then a 1-second Play > cue
+
+Set DEFAULT_MEDIA_DIR, DEFAULT_SIZE, OUTPUT_FPS, HLS_TIME, REWIND_SECONDS,
+REWIND_RAMP_FRACTION, REWIND_GLITCH_SECONDS, REWIND_ZERO_HOLD_SECONDS,
+PLAY_SCREEN_SECONDS, PORT, or BIND_ADDR in the environment to override these settings.
+EOF
+  exit 0
+fi
+
+
+# Sleep Timer
+
+if [[ "${1:-}" == "sleep" ]]; then
+  if [[ $# -ne 2 || ! "$2" =~ ^[0-9]+$ ]]; then
+    echo "usage: broadcast sleep MINUTES" >&2
+    exit 2
+  fi
+
+  if [[ ! -s "$BROADCAST_PID_FILE" ]]; then
+    echo "No running broadcast found in $ROOT_HLS_DIR" >&2
+    exit 1
+  fi
+
+  read -r broadcast_pid < "$BROADCAST_PID_FILE"
+
+  if ! [[ "$broadcast_pid" =~ ^[0-9]+$ ]]; then
+    echo "Invalid broadcast PID file: $BROADCAST_PID_FILE" >&2
+    exit 1
+  fi
+
+  broadcast_is_running() {
+    local command_line
+
+    command_line="$(ps -p "$broadcast_pid" -o args= 2>/dev/null || true)"
+
+    [[ "$command_line" =~ (^|[[:space:]/])broadcast([[:space:]]|$) ]]
+  }
+
+  if ! broadcast_is_running; then
+    echo "Broadcast PID $broadcast_pid is no longer running" >&2
+    exit 1
+  fi
+
+  format_remaining() {
+    local total="$1"
+    local days=$((total / 86400))
+    local hours=$(((total % 86400) / 3600))
+    local minutes=$(((total % 3600) / 60))
+    local seconds=$((total % 60))
+
+    if (( days > 0 )); then
+      printf '%dd %02dh %02dm %02ds' \
+        "$days" "$hours" "$minutes" "$seconds"
+    elif (( hours > 0 )); then
+      printf '%dh %02dm %02ds' \
+        "$hours" "$minutes" "$seconds"
+    elif (( minutes > 0 )); then
+      printf '%dm %02ds' \
+        "$minutes" "$seconds"
+    else
+      printf '%ds' "$seconds"
+    fi
+  }
+
+  trap 'rm -f "$SLEEP_FILE"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  end_epoch=$(( $(date +%s) + 10#$2 * 60 ))
+  last_text=""
+
+  while (( $(date +%s) < end_epoch )); do
+    if ! broadcast_is_running; then
+      echo "Broadcast stopped before the sleep timer ended" >&2
       exit 1
     fi
+
+    remaining=$((end_epoch - $(date +%s)))
+
+    if (( remaining <= 60 )); then
+      current_text="sleep $(format_remaining "$remaining")"
+    else
+      current_text="sleep $(((remaining + 59) / 60))m"
+    fi
+
+    if [[ "$current_text" != "$last_text" ]]; then
+      printf '%s\n' "$current_text" > "$SLEEP_FILE"
+      last_text="$current_text"
+    fi
+
+    sleep 1
   done
+
+  if broadcast_is_running; then
+    kill "$broadcast_pid"
+  fi
+
+  exit 0
+fi
+
+
+# Ad Trigger
+
+run_ad_command=0
+
+if [[ "$(basename "$0")" == "broadcastad" ]]; then
+  run_ad_command=1
+fi
+
+if [[ "${1:-}" == "ad" ]]; then
+  run_ad_command=1
+  shift
+fi
+
+if [[ "$run_ad_command" -eq 1 ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "usage: broadcast ad SECONDS FILE" >&2
+    echo "   or: broadcastad SECONDS FILE" >&2
+    exit 1
+  fi
+
+  delay="$1"
+  ad_file="$2"
+
+  if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
+    echo "Delay must be seconds, like: 45" >&2
+    exit 1
+  fi
+
+  ad_path="$(
+    python3 - "$ad_file" <<'PY'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1]).expanduser()
+
+try:
+    print(str(p.resolve(strict=True)))
+except FileNotFoundError:
+    raise SystemExit(2)
+PY
+  )" || {
+    echo "No such ad file: $ad_file" >&2
+    exit 1
+  }
+
+  tmp="${AD_REQUEST_FILE}.$$"
+
+  printf "%s\t%s\n" "$delay" "$ad_path" > "$tmp"
+  mv "$tmp" "$AD_REQUEST_FILE"
+
+  echo "Ad queued: break in ${delay}s -> $ad_path"
+
+  exit 0
+fi
+
+
+# Arguments
+
+NOW_PLAYING_TITLE=""
+MEDIA_PATH=""
+
+while (( $# > 0 )); do
+  case "$1" in
+    --now-playing)
+      if (( $# < 2 )); then
+        echo "--now-playing requires a title" >&2
+        exit 2
+      fi
+
+      NOW_PLAYING_TITLE="$2"
+      shift 2
+      ;;
+
+    --)
+      shift
+
+      if (( $# != 1 )) || [[ -n "$MEDIA_PATH" ]]; then
+        echo "usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]" >&2
+        exit 2
+      fi
+
+      MEDIA_PATH="$1"
+      shift
+      ;;
+
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+
+    *)
+      if [[ -n "$MEDIA_PATH" ]]; then
+        echo "usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]" >&2
+        exit 2
+      fi
+
+      MEDIA_PATH="$1"
+      shift
+      ;;
+  esac
+done
+
+MEDIA_PATH="${MEDIA_PATH:-$DEFAULT_MEDIA_DIR}"
+
+if [[ ! -e "$MEDIA_PATH" ]]; then
+  echo "No such file or folder: $MEDIA_PATH" >&2
+  exit 1
+fi
+
+
+# Helpers
+
+set_scroll_text() {
+  local text="${1:-}"
+
+  if [[ -n "$text" ]]; then
+    printf "%s\n" "$text" > "$SCROLL_FILE"
+  else
+    : > "$SCROLL_FILE"
+  fi
 }
 
-cleanup() {
-  local exit_code=$?
-  trap - EXIT INT TERM
+set_break_countdown_text() {
+  local remaining="$1"
 
-  log_info "Cleaning up processes and temporary files..."
+  if [[ -n "$DEFAULT_SCROLL_TEXT" ]]; then
+    set_scroll_text "COMMERCIAL BREAK IN ${remaining}  //  ${DEFAULT_SCROLL_TEXT}"
+  else
+    set_scroll_text "COMMERCIAL BREAK IN ${remaining}"
+  fi
+}
 
-  touch "$STOP_FILE" 2>/dev/null || true
+kill_encoder() {
+  local pid=""
 
-  for pid in "$CHANNEL_PID" "$AD_WATCHER_PID" "$QUOTE_PID" "$SERVER_PID"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+  if [[ -s "$ENCODER_PID_FILE" ]]; then
+    read -r pid < "$ENCODER_PID_FILE" || true
+
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
       kill "$pid" 2>/dev/null || true
+
+      local attempt
+
+      for attempt in {1..50}; do
+        [[ ! -e "$ENCODER_PID_FILE" ]] && return 0
+        sleep 0.1
+      done
+
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  fi
+}
+
+
+# Runtime
+
+require_runtime() {
+  local missing=()
+  local cmd
+
+  for cmd in "$FFMPEG" "$FFPROBE" python3 curl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
     fi
   done
 
-  rm -rf "$ROOT_HLS_DIR" 2>/dev/null || true
-  exit "$exit_code"
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "Missing required app(s): ${missing[*]}" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$LOGO_PATH" ]]; then
+    echo "[warn] Logo not found, continuing without logo: $LOGO_PATH" >&2
+  fi
 }
 
-set_scroll_text() {
-  local text="$1"
-  mkdir -p "$CONTROL_DIR"
-  printf "%s\n" "$text" > "$SCROLL_TEXT_FILE"
+
+# Cleanup
+
+cleanup() {
+  local status="$1"
+
+  touch "$STOP_FILE"
+
+  echo -e "\n\033[0;31m[!] Cleanup...\033[0m"
+
+  kill_encoder
+
+  local pid
+
+  for pid in \
+    "$CHANNEL_PID" \
+    "$AD_PID" \
+    "$QUOTE_PID" \
+    "$SERVER_PID" \
+    "$TIMER_PID"
+  do
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+
+  rm -rf "$ROOT_HLS_DIR"
+
+  rm -f \
+    "$STOP_FILE" \
+    "$QUOTE_FILE" \
+    "$NOW_PLAYING_FILE" \
+    "$SCROLL_FILE" \
+    "$REWIND_LABEL_FILE" \
+    "$REWIND_TEXT_FILE" \
+    "$AD_NOW_FILE"
+
+  echo "[+] Broadcast stopped."
+
+  return "$status"
 }
+
+
+# Web Server
+
+start_server() {
+  echo "[*] Starting Web Server on $BIND_ADDR:$PORT..."
+
+  BIND_ADDR="$BIND_ADDR" \
+  PORT="$PORT" \
+  ROOT_HLS_DIR="$ROOT_HLS_DIR" \
+  python3 - >/tmp/broadcast-server.log 2>&1 <<'PY' &
+import http.server
+import os
+
+BIND_ADDR = os.environ["BIND_ADDR"]
+PORT = int(os.environ["PORT"])
+ROOT = os.environ["ROOT_HLS_DIR"]
+
+
+class HLSHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=ROOT, **kwargs)
+
+    def guess_type(self, path):
+        path = str(path)
+
+        if path.endswith(".m3u8"):
+            return "application/vnd.apple.mpegurl"
+
+        if path.endswith(".ts"):
+            return "video/mp2t"
+
+        if path.endswith(".json"):
+            return "application/json"
+
+        return super().guess_type(path)
+
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class Server(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+Server((BIND_ADDR, PORT), HLSHandler).serve_forever()
+PY
+
+  SERVER_PID="$!"
+}
+
+wait_for_server() {
+  local check_addr="$BIND_ADDR"
+
+  if [[ "$check_addr" == "0.0.0.0" || "$check_addr" == "::" ]]; then
+    check_addr="127.0.0.1"
+  fi
+
+  local url="http://$check_addr:$PORT/channels.json"
+  local i
+
+  for i in {1..50}; do
+    if curl -sf --max-time 1 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+
+    if [[ -n "$SERVER_PID" ]] &&
+       ! kill -0 "$SERVER_PID" 2>/dev/null
+    then
+      echo "[error] Web server exited before it was reachable." >&2
+      cat /tmp/broadcast-server.log >&2 2>/dev/null || true
+      exit 1
+    fi
+
+    sleep 0.1
+  done
+
+  echo "[error] Web server did not become reachable at $url" >&2
+  cat /tmp/broadcast-server.log >&2 2>/dev/null || true
+
+  exit 1
+}
+
+
+# Quotes
+
+fetch_quote() {
+  local symbol="$1"
+  local url="$QUOTE_BASE_URL/$symbol"
+  local out=""
+
+  out="$(
+    curl -sf --max-time 5 "$url" 2>/dev/null |
+    python3 -c '
+import json
+import math
+import sys
+
+try:
+    d = json.load(sys.stdin)
+    price = None
+
+    if isinstance(d, dict):
+        for key in ("price", "last", "mark", "close", "c"):
+            if d.get(key) is not None:
+                price = d[key]
+                break
+
+        series = (
+            d.get("priceSeries")
+            or d.get("prices")
+            or d.get("data")
+            or []
+        )
+
+        if price is None and isinstance(series, list) and series:
+            latest = series[-1]
+
+            if isinstance(latest, dict):
+                for key in ("last", "price", "mark", "close", "c"):
+                    if latest.get(key) is not None:
+                        price = latest[key]
+                        break
+
+                if (
+                    price is None
+                    and latest.get("hi") is not None
+                    and latest.get("lo") is not None
+                ):
+                    price = (
+                        float(latest["hi"])
+                        + float(latest["lo"])
+                    ) / 2
+            else:
+                price = latest
+
+    if price is None:
+        raise ValueError("missing price")
+
+    value = float(price)
+
+    if not math.isfinite(value):
+        raise ValueError("bad price")
+
+    print(str(math.trunc(value)))
+
+except Exception:
+    print("-----")
+' 2>/dev/null || true
+  )"
+
+  if [[ -z "$out" ]]; then
+    out="-----"
+  fi
+
+  printf "%s" "$out"
+}
+
+start_quote_file() {
+  (
+    local nq_now="-----"
+    local next_quote_refresh=0
+    local now_epoch=""
+    local current_time=""
+
+    while [[ ! -f "$STOP_FILE" ]]; do
+      now_epoch="$(date +%s)"
+      current_time="$(date '+%H:%M')"
+
+      if [[ "$now_epoch" -ge "$next_quote_refresh" ]]; then
+        nq_now="$(fetch_quote NQ)"
+        next_quote_refresh=$((now_epoch + QUOTE_REFRESH_SECONDS))
+      fi
+
+      printf "%s  NQ %s\n" \
+        "$current_time" \
+        "$nq_now" \
+        > "$QUOTE_FILE"
+
+      sleep 1
+    done
+  ) &
+
+  QUOTE_PID="$!"
+}
+
+
+# Commercial Breaks
+
+start_ad_watcher() {
+  (
+    while [[ ! -f "$STOP_FILE" ]]; do
+      if [[ -f "$AD_NOW_FILE" ]]; then
+        sleep 1
+        continue
+      fi
+
+      if [[ ! -s "$AD_REQUEST_FILE" ]]; then
+        sleep 1
+        continue
+      fi
+
+      local delay=""
+      local ad_path=""
+
+      IFS=$'\t' read -r delay ad_path < "$AD_REQUEST_FILE" || true
+      rm -f "$AD_REQUEST_FILE"
+
+      if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
+        delay="0"
+      fi
+
+      if [[ -z "$ad_path" || ! -f "$ad_path" ]]; then
+        set_scroll_text "$DEFAULT_SCROLL_TEXT"
+        continue
+      fi
+
+      local remaining="$delay"
+
+      while [[ "$remaining" -gt 0 && ! -f "$STOP_FILE" ]]; do
+        set_break_countdown_text "$remaining"
+
+        sleep 1
+
+        remaining=$((remaining - 1))
+      done
+
+      if [[ -f "$STOP_FILE" ]]; then
+        break
+      fi
+
+      printf "%s\n" "$ad_path" > "$AD_NOW_FILE"
+
+      set_scroll_text "COMMERCIAL BREAK"
+
+      echo -e \
+        "\033[0;35m[ad]\033[0m Starting commercial: $ad_path"
+
+      kill_encoder
+
+      sleep 1
+    done
+  ) &
+
+  AD_PID="$!"
+}
+
+
+# Channel Manifest
+
+write_channel_manifest() {
+  local manifest="$ROOT_HLS_DIR/channels.json"
+
+  python3 - "$manifest" <<'PY'
+import json
+import sys
+
+manifest = sys.argv[1]
+
+out = [
+    {
+        "number": "03",
+        "name": "PRIME",
+        "path": "/Prime/index.m3u8",
+    }
+]
+
+with open(manifest, "w", encoding="utf-8") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+PY
+}
+
+
+# Media Discovery
 
 list_media_files() {
-  local path="$1"
-  if [[ -f "$path" ]]; then
-    printf "%s\0" "$path"
-  elif [[ -d "$path" ]]; then
-    find -L "$path" -type f \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.mov" -o -iname "*.avi" -o -iname "*.webm" \) -print0 | sort -z
-  fi
+  local media_path="$1"
+
+  python3 - "$media_path" "$FFPROBE" <<'PY'
+import random
+import signal
+import subprocess
+import sys
+
+from pathlib import Path
+
+
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+media_path = Path(sys.argv[1]).expanduser()
+ffprobe = sys.argv[2]
+
+exts = {
+    ".mp4",
+    ".mkv",
+    ".mov",
+    ".m4v",
+    ".webm",
 }
 
-# HLS Transcoding & Rewind Mechanics
+if media_path.is_file():
+    candidates = [media_path.resolve()]
+
+elif media_path.is_dir():
+    candidates = sorted(
+        (
+            p.resolve()
+            for p in media_path.rglob("*")
+            if p.is_file()
+            and p.suffix.lower() in exts
+            and not p.name.startswith("._")
+        ),
+        key=lambda p: str(p).lower(),
+    )
+
+    random.shuffle(candidates)
+
+else:
+    raise SystemExit(
+        f"No such file or folder: {media_path}"
+    )
+
+
+good_count = 0
+
+for path in candidates:
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+
+        if (
+            result.returncode == 0
+            and "video" in result.stdout
+        ):
+            good_count += 1
+
+            sys.stdout.buffer.write(
+                str(path).encode("utf-8") + b"\0"
+            )
+
+            sys.stdout.buffer.flush()
+
+        else:
+            print(
+                f"[skip bad media] {path}",
+                file=sys.stderr,
+            )
+
+    except Exception:
+        print(
+            f"[skip bad media] {path}",
+            file=sys.stderr,
+        )
+
+if not good_count:
+    raise SystemExit(
+        f"No playable media files found in {media_path}"
+    )
+PY
+}
+
+
+# Video Filter
+
+build_video_filter() {
+  local width="$1"
+  local height="$2"
+
+  local font_path=""
+  local font_arg=""
+  local v_filter=""
+
+  local quote_row_bottom="$BUG_ROW_BOTTOM"
+  local quote_output="bugged"
+
+  if [[ -n "$NOW_PLAYING_TITLE" ]]; then
+    quote_row_bottom=$((BUG_ROW_BOTTOM + BUG_FONT_SIZE + 6))
+    quote_output="quoted"
+  fi
+
+  if command -v fc-match >/dev/null 2>&1; then
+    font_path="$(
+      fc-match \
+        -f '%{file}\n' \
+        'ComicShannsMono Nerd Font' \
+        2>/dev/null |
+      head -n 1 ||
+      true
+    )"
+  fi
+
+  if [[ -z "$font_path" || ! -f "$font_path" ]]; then
+    font_path="/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf"
+  fi
+
+  if [[ -f "$font_path" ]]; then
+    font_arg="fontfile='$font_path':"
+  fi
+
+  v_filter="fps=$OUTPUT_FPS,"
+  v_filter+="setsar=1,"
+  v_filter+="scale=$width:$height:"
+  v_filter+="force_original_aspect_ratio=decrease:"
+  v_filter+="force_divisible_by=2,"
+  v_filter+="pad=$width:$height:(ow-iw)/2:(oh-ih)/2,"
+  v_filter+="setsar=1,"
+  v_filter+="format=yuv420p[main];"
+
+  # Logo
+
+  if [[ -f "$LOGO_PATH" ]]; then
+    v_filter+="movie='$LOGO_PATH',"
+    v_filter+="scale=$BUG_LOGO_WIDTH:-1[logo];"
+
+    v_filter+="[main][logo]"
+    v_filter+="overlay="
+    v_filter+="$BUG_PAD:"
+    v_filter+="H-h-$quote_row_bottom"
+    v_filter+="[bugbase];"
+  else
+    v_filter+="[main]null[bugbase];"
+  fi
+
+  # Time And NQ
+
+  v_filter+="[bugbase]drawtext="
+  v_filter+="$font_arg"
+  v_filter+="textfile='$QUOTE_FILE':"
+  v_filter+="reload=1:"
+  v_filter+="x=W-tw-$BUG_PAD:"
+  v_filter+="y=H-th-$quote_row_bottom:"
+  v_filter+="fontsize=$BUG_FONT_SIZE:"
+  v_filter+="fontcolor=white:"
+  v_filter+="box=1:"
+  v_filter+="boxcolor=black@0.50:"
+  v_filter+="boxborderw=$BUG_BOX_PAD"
+  v_filter+="[$quote_output];"
+
+  # Now Playing
+
+  if [[ -n "$NOW_PLAYING_TITLE" ]]; then
+    v_filter+="[quoted]drawtext="
+    v_filter+="$font_arg"
+    v_filter+="textfile='$NOW_PLAYING_FILE':"
+    v_filter+="x=W-tw-$BUG_PAD:"
+    v_filter+="y=H-th-$BUG_ROW_BOTTOM:"
+    v_filter+="fontsize=$BUG_FONT_SIZE:"
+    v_filter+="fontcolor=white:"
+    v_filter+="box=1:"
+    v_filter+="boxcolor=black@0.50:"
+    v_filter+="boxborderw=$BUG_BOX_PAD"
+    v_filter+="[bugged];"
+  fi
+
+  # Ticker
+
+  v_filter+="[bugged]drawtext="
+  v_filter+="$font_arg"
+  v_filter+="textfile='$SCROLL_FILE':"
+  v_filter+="reload=1:"
+  v_filter+="x=W-mod(t*$SCROLL_SPEED\\,W+tw):"
+  v_filter+="y=H-th-$TICKER_BOTTOM:"
+  v_filter+="fontsize=$TICKER_FONT_SIZE:"
+  v_filter+="fontcolor=white:"
+  v_filter+="box=1:"
+  v_filter+="boxcolor=black@0.55:"
+  v_filter+="boxborderw=$TICKER_BOX_PAD"
+
+  printf "%s" "$v_filter"
+}
+
+
+# Rewind Helpers
+
+probe_media_duration_ms() {
+  local media_file="$1"
+
+  "$FFPROBE" \
+    -v error \
+    -show_entries format=duration \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$media_file" |
+  python3 -c '
+import math
+import sys
+
+try:
+    value = float(sys.stdin.read().strip())
+    if not math.isfinite(value) or value < 0:
+        raise ValueError
+    print(int(round(value * 1000)))
+except Exception:
+    print(0)
+'
+}
+
+format_rewind_time() {
+  local total_ms="$1"
+
+  python3 - "$total_ms" <<'PY'
+import sys
+
+try:
+    total_ms = max(0, int(sys.argv[1]))
+except Exception:
+    total_ms = 0
+
+hours, rem = divmod(total_ms, 3_600_000)
+minutes, rem = divmod(rem, 60_000)
+seconds, millis = divmod(rem, 1_000)
+
+print(f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}")
+PY
+}
+
+
+# HLS Encoder
 
 run_ffmpeg_hls() {
-  local input_file="$1"
+  local media_file="$1"
   local hls_dir="$2"
-  local video_filter="$3"
+  local v_filter="$3"
   local loop_mode="$4"
 
-  mkdir -p "$hls_dir"
+  local loop_args=()
 
-  local filter_arg=""
-  if [[ -n "$video_filter" ]]; then
-    filter_arg="-vf $video_filter"
+  if [[ "$loop_mode" == "loop" ]]; then
+    loop_args=(-stream_loop -1)
   fi
 
-  ffmpeg -hide_banner -loglevel error -re \
-    -i "$input_file" \
-    $filter_arg \
-    -c:v libx264 -preset ultrafast -tune zerolatency \
-    -c:a aac -ar 44100 -ac 2 \
+  "$FFMPEG" \
+    -nostdin \
+    -hide_banner \
+    -loglevel warning \
+    -re \
+    "${loop_args[@]}" \
+    -fflags +genpts+discardcorrupt \
+    -err_detect ignore_err \
+    -i "$media_file" \
+    -map 0:v:0 \
+    -map 0:a? \
+    -vf "$v_filter" \
+    -c:v libx264 \
+    -preset veryfast \
+    -profile:v main \
+    -b:v "$VIDEO_BITRATE" \
+    -maxrate "$VIDEO_MAXRATE" \
+    -bufsize "$VIDEO_BUFSIZE" \
+    -g "$((OUTPUT_FPS * HLS_TIME))" \
+    -keyint_min "$((OUTPUT_FPS * HLS_TIME))" \
+    -sc_threshold 0 \
+    -pix_fmt yuv420p \
+    -c:a aac \
+    -b:a "$AUDIO_BITRATE" \
+    -ar 44100 \
+    -ac 2 \
+    -dn \
+    -sn \
     -f hls \
-    -hls_time 2 \
-    -hls_list_size 5 \
-    -hls_flags delete_segments+omit_endlist \
-    -hls_segment_filename "${hls_dir}/segment_%03d.ts" \
-    "${hls_dir}/stream.m3u8"
+    -hls_time "$HLS_TIME" \
+    -hls_list_size "$HLS_LIST_SIZE" \
+    -hls_start_number_source epoch \
+    -hls_flags \
+      delete_segments+omit_endlist+program_date_time+independent_segments \
+    -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
+    -hls_segment_filename "$hls_dir/seg_%d.ts" \
+    "$hls_dir/index.m3u8" &
+
+  local encoder_pid="$!"
+  local status=0
+  local watchdog_pid=""
+
+  printf '%s\n' "$encoder_pid" > "$ENCODER_PID_FILE"
+
+  (
+    local started=""
+    local now=""
+    local mtime=""
+    local age=""
+
+    started="$(date +%s)"
+
+    while kill -0 "$encoder_pid" 2>/dev/null &&
+          [[ ! -f "$STOP_FILE" ]]
+    do
+      sleep 5
+
+      now="$(date +%s)"
+
+      if (( now - started < WATCHDOG_GRACE_SECONDS )); then
+        continue
+      fi
+
+      if [[ -f "$hls_dir/index.m3u8" ]]; then
+        mtime="$(
+          stat -c %Y \
+            "$hls_dir/index.m3u8" \
+            2>/dev/null ||
+          echo 0
+        )"
+
+        age=$((now - mtime))
+
+        if (( age > WATCHDOG_STALE_SECONDS )); then
+          echo -e \
+            "\033[0;31m[watchdog]\033[0m HLS stale for ${age}s; restarting encoder." \
+            >&2
+
+          kill "$encoder_pid" 2>/dev/null || true
+
+          sleep 2
+
+          kill -9 "$encoder_pid" 2>/dev/null || true
+
+          break
+        fi
+
+      else
+        echo -e \
+          "\033[0;31m[watchdog]\033[0m Encoder produced no HLS after ${WATCHDOG_GRACE_SECONDS}s; restarting." \
+          >&2
+
+        kill "$encoder_pid" 2>/dev/null || true
+
+        sleep 2
+
+        kill -9 "$encoder_pid" 2>/dev/null || true
+
+        break
+      fi
+    done
+  ) &
+
+  watchdog_pid="$!"
+
+  wait "$encoder_pid" || status="$?"
+
+  kill "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  rm -f "$ENCODER_PID_FILE"
+
+  return "$status"
 }
+
 
 run_rewind_hls() {
   local media_file="$1"
@@ -146,239 +1087,428 @@ run_rewind_hls() {
   local width="$3"
   local height="$4"
 
-  log_info "Simulating VHS rewind slate for: $media_file"
-  set_scroll_text "REWINDING TAPE /// PLEASE STAND BY"
+  local duration_ms="0"
+  local font_path=""
+  local font_arg=""
+  local rewind_filter=""
+  local encoder_pid=""
+  local updater_pid=""
+  local total_slate_seconds=0
+  local status=0
 
-  # Fast visual scramble filter representing rewind artifacts
-  local rewind_filter="drawtext=text='<< REW':fontcolor=white:fontsize=48:x=50:y=50,noise=alls=20:allf=t+u,eq=saturation=0.2"
+  duration_ms="$(
+    probe_media_duration_ms "$media_file" 2>/dev/null ||
+    echo 0
+  )"
 
-  ffmpeg -hide_banner -loglevel error -re \
-    -f lavfi -i "color=c=blue:s=${width}x${height}:d=3" \
+  if ! [[ "$duration_ms" =~ ^[0-9]+$ ]]; then
+    duration_ms="0"
+  fi
+
+  printf '%s\n' '<< Rewind' > "$REWIND_LABEL_FILE"
+
+  printf '%s\n' \
+    "$(format_rewind_time "$duration_ms")" \
+    > "$REWIND_TEXT_FILE"
+
+  if command -v fc-match >/dev/null 2>&1; then
+    font_path="$(
+      fc-match \
+        -f '%{file}\n' \
+        'ComicShannsMono Nerd Font' \
+        2>/dev/null |
+      head -n 1 ||
+      true
+    )"
+  fi
+
+  if [[ -z "$font_path" || ! -f "$font_path" ]]; then
+    font_path="/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf"
+  fi
+
+  if [[ -f "$font_path" ]]; then
+    font_arg="fontfile='$font_path':"
+  fi
+
+  # A short, unmistakable analog static burst bridges the movie into the blue VCR slate.
+  # Keep it long enough to survive HLS/player timing, but still feel like a tape glitch.
+  # Text stays hidden during the glitch, then the transport screen appears cleanly.
+  rewind_filter="noise=alls=100:allf=t+u:"
+  rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
+  rewind_filter+="eq=contrast=2.8:brightness=0.08:saturation=0:"
+  rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
+  rewind_filter+="hue=s=0:"
+  rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
+  rewind_filter+="drawtext=${font_arg}"
+  rewind_filter+="textfile='$REWIND_LABEL_FILE':"
+  rewind_filter+="reload=1:"
+  rewind_filter+="x=(w-text_w)/2:"
+  rewind_filter+="y=(h/2)-42:"
+  rewind_filter+="fontsize=$REWIND_LABEL_FONT_SIZE:"
+  rewind_filter+="fontcolor=white:"
+  rewind_filter+="enable='gte(t\,$REWIND_GLITCH_SECONDS)',"
+  rewind_filter+="drawtext=${font_arg}"
+  rewind_filter+="textfile='$REWIND_TEXT_FILE':"
+  rewind_filter+="reload=1:"
+  rewind_filter+="x=(w-text_w)/2:"
+  rewind_filter+="y=(h/2)+8:"
+  rewind_filter+="fontsize=$REWIND_TIME_FONT_SIZE:"
+  rewind_filter+="fontcolor=white:"
+  rewind_filter+="enable='gte(t\,$REWIND_GLITCH_SECONDS)'"
+
+  total_slate_seconds="$(
+    python3 - \
+      "$REWIND_GLITCH_SECONDS" \
+      "$REWIND_SECONDS" \
+      "$REWIND_ZERO_HOLD_SECONDS" \
+      "$PLAY_SCREEN_SECONDS" <<'PY'
+import sys
+
+values = [max(0.0, float(v)) for v in sys.argv[1:]]
+print(f"{sum(values):.3f}")
+PY
+  )"
+
+  echo -e \
+    "\033[0;34m[Prime]\033[0m glitch (${REWIND_GLITCH_SECONDS}s) -> << Rewind (${REWIND_SECONDS}s) -> zero (${REWIND_ZERO_HOLD_SECONDS}s) -> Play > (${PLAY_SCREEN_SECONDS}s)"
+
+  "$FFMPEG" \
+    -nostdin \
+    -hide_banner \
+    -loglevel warning \
+    -re \
+    -f lavfi \
+    -i "color=c=$REWIND_BG_COLOR:s=${width}x${height}:r=$OUTPUT_FPS" \
+    -re \
+    -f lavfi \
+    -i "anullsrc=r=44100:cl=stereo" \
+    -map 0:v:0 \
+    -map 1:a:0 \
     -vf "$rewind_filter" \
-    -c:v libx264 -preset ultrafast \
-    -c:a aac -ar 44100 -ac 2 \
+    -t "$total_slate_seconds" \
+    -c:v libx264 \
+    -preset veryfast \
+    -profile:v main \
+    -b:v "$VIDEO_BITRATE" \
+    -maxrate "$VIDEO_MAXRATE" \
+    -bufsize "$VIDEO_BUFSIZE" \
+    -g "$((OUTPUT_FPS * HLS_TIME))" \
+    -keyint_min "$((OUTPUT_FPS * HLS_TIME))" \
+    -sc_threshold 0 \
+    -pix_fmt yuv420p \
+    -c:a aac \
+    -b:a "$AUDIO_BITRATE" \
+    -ar 44100 \
+    -ac 2 \
     -f hls \
-    -hls_time 2 \
-    -hls_list_size 5 \
-    -hls_flags delete_segments+omit_endlist \
-    -hls_segment_filename "${hls_dir}/segment_%03d.ts" \
-    "${hls_dir}/stream.m3u8" || true
+    -hls_time "$HLS_TIME" \
+    -hls_list_size "$HLS_LIST_SIZE" \
+    -hls_start_number_source epoch \
+    -hls_flags \
+      delete_segments+omit_endlist+program_date_time+independent_segments \
+    -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
+    -hls_segment_filename "$hls_dir/seg_%d.ts" \
+    "$hls_dir/index.m3u8" &
 
-  set_scroll_text "$DEFAULT_SCROLL_TEXT"
+  encoder_pid="$!"
+  printf '%s\n' "$encoder_pid" > "$ENCODER_PID_FILE"
+
+  python3 - \
+    "$REWIND_LABEL_FILE" \
+    "$REWIND_TEXT_FILE" \
+    "$duration_ms" \
+    "$REWIND_GLITCH_SECONDS" \
+    "$REWIND_SECONDS" \
+    "$REWIND_RAMP_FRACTION" \
+    "$REWIND_ZERO_HOLD_SECONDS" \
+    "$PLAY_SCREEN_SECONDS" \
+    "$STOP_FILE" \
+    "$AD_NOW_FILE" <<'PY' &
+import os
+import sys
+import time
+
+label_path = sys.argv[1]
+text_path = sys.argv[2]
+duration_ms = max(0, int(sys.argv[3]))
+
+try:
+    glitch_seconds = max(0.0, float(sys.argv[4]))
+except Exception:
+    glitch_seconds = 0.60
+
+rewind_seconds = max(0.001, float(sys.argv[5]))
+
+try:
+    ramp_fraction = float(sys.argv[6])
+except Exception:
+    ramp_fraction = 0.18
+
+try:
+    zero_hold_seconds = max(0.0, float(sys.argv[7]))
+except Exception:
+    zero_hold_seconds = 0.35
+
+try:
+    play_seconds = max(0.0, float(sys.argv[8]))
+except Exception:
+    play_seconds = 1.0
+
+ramp_fraction = min(0.49, max(0.01, ramp_fraction))
+stop_path = sys.argv[9]
+ad_path = sys.argv[10]
+
+
+def format_time(total_ms):
+    total_ms = max(0, int(total_ms))
+    hours, rem = divmod(total_ms, 3_600_000)
+    minutes, rem = divmod(rem, 60_000)
+    seconds, millis = divmod(rem, 1_000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
+def write_text_atomic(path, value):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(value + "\n")
+    os.replace(tmp, path)
+
+
+def write_time_atomic(value):
+    write_text_atomic(text_path, format_time(value))
+
+
+write_text_atomic(label_path, "<< Rewind")
+write_time_atomic(duration_ms)
+
+# Let the analog glitch occupy the handoff from movie to transport screen.
+glitch_started = time.monotonic()
+while time.monotonic() - glitch_started < glitch_seconds:
+    if os.path.exists(stop_path) or os.path.exists(ad_path):
+        break
+    time.sleep(0.01)
+
+started = time.monotonic()
+
+while True:
+    if os.path.exists(stop_path) or os.path.exists(ad_path):
+        break
+
+    elapsed = time.monotonic() - started
+    fraction = min(1.0, elapsed / rewind_seconds)
+
+    # Mechanical rewind profile:
+    # spool up -> steady motor speed -> spool down.
+    # The timestamp movement follows the motor's speed, rather than
+    # moving linearly from the first frame to the last.
+    r = ramp_fraction
+    max_speed = 1.0 / (1.0 - r)
+
+    if fraction < r:
+        progress = 0.5 * (max_speed / r) * fraction * fraction
+    elif fraction <= 1.0 - r:
+        progress = (0.5 * max_speed * r) + max_speed * (fraction - r)
+    else:
+        tail = 1.0 - fraction
+        progress = 1.0 - 0.5 * (max_speed / r) * tail * tail
+
+    progress = min(1.0, max(0.0, progress))
+    remaining = round(duration_ms * (1.0 - progress))
+    write_time_atomic(remaining)
+
+    if fraction >= 1.0:
+        break
+
+    time.sleep(0.025)
+
+# The rewind must visibly land on zero before the transport changes state.
+write_time_atomic(0)
+
+zero_started = time.monotonic()
+while time.monotonic() - zero_started < zero_hold_seconds:
+    if os.path.exists(stop_path) or os.path.exists(ad_path):
+        break
+    time.sleep(0.025)
+
+if not os.path.exists(stop_path) and not os.path.exists(ad_path):
+    # Same blue screen and same zero stamp; only the transport state changes.
+    write_text_atomic(label_path, "Play >")
+    play_started = time.monotonic()
+
+    while time.monotonic() - play_started < play_seconds:
+        if os.path.exists(stop_path) or os.path.exists(ad_path):
+            break
+        time.sleep(0.025)
+PY
+
+  updater_pid="$!"
+
+  wait "$encoder_pid" || status="$?"
+
+  kill "$updater_pid" 2>/dev/null || true
+  wait "$updater_pid" 2>/dev/null || true
+
+  rm -f "$ENCODER_PID_FILE"
+
+  return "$status"
 }
 
-# Manifest & Server Workers
 
-write_channel_manifest() {
-  mkdir -p "$ROOT_HLS_DIR"
-  cat <<EOF > "${ROOT_HLS_DIR}/index.html"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>VHS Retro Stream</title>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <style>
-    body { background: #050505; color: #33ff33; font-family: monospace; text-align: center; margin: 0; padding: 20px; }
-    #player { width: 800px; height: 450px; background: #000; margin: 0 auto; border: 4px solid #333; box-shadow: 0 0 20px #00ff6633; }
-    #ticker { width: 800px; margin: 10px auto; background: #111; overflow: hidden; white-space: nowrap; border: 1px solid #333; }
-    #ticker span { display: inline-block; padding-left: 100%; animation: ticker 15s linear infinite; }
-    @keyframes ticker { 0% { transform: translate(0, 0); } 100% { transform: translate(-100%, 0); } }
-  </style>
-</head>
-<body>
-  <h1>LIVE BROADCAST CHANNEL</h1>
-  <video id="player" controls autoplay muted></video>
-  <div id="ticker"><span id="ticker-text">LOADING...</span></div>
-  <script>
-    const video = document.getElementById('player');
-    if (Hls.isSupported()) {
-      const hls = new Hls();
-      hls.loadSource('/live/stream.m3u8');
-      hls.attachMedia(video);
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = '/live/stream.m3u8';
-    }
-    
-    async function updateTicker() {
-      try {
-        const res = await fetch('/control/scroll_text.txt');
-        if (res.ok) { document.getElementById('ticker-text').innerText = await res.text(); }
-      } catch (e) {}
-    }
-    setInterval(updateTicker, 3000);
-    updateTicker();
-  </script>
-</body>
-</html>
-EOF
-}
-
-start_server() {
-  log_info "Starting HTTP File Server on $BIND_ADDR:$PORT"
-  python3 -m http.server "$PORT" --bind "$BIND_ADDR" --directory "$ROOT_HLS_DIR" &>/dev/null &
-  SERVER_PID="$!"
-}
-
-wait_for_server() {
-  local retries=30
-  while (( retries > 0 )); do
-    if nc -z "$BIND_ADDR" "$PORT" 2>/dev/null || python3 -c "import socket; s = socket.socket(); s.connect(('$BIND_ADDR', $PORT))" 2>/dev/null; then
-      log_info "HTTP Server ready."
-      return 0
-    fi
-    sleep 0.2
-    (( retries-- ))
-  done
-  log_err "Server failed to start."
-  exit 1
-}
-
-# Background Feature Watchers
-
-start_quote_file() {
-  if [[ ! -f "$QUOTES_FILE" ]]; then
-    return 0
-  fi
-
-  (
-    while [[ ! -f "$STOP_FILE" ]]; do
-      shuf -n 1 "$QUOTES_FILE" | while read -r line; do
-        if [[ -n "$line" && ! -f "$AD_NOW_FILE" ]]; then
-          set_scroll_text "$line"
-        fi
-      done
-      sleep 30
-    done
-  ) &
-  QUOTE_PID="$!"
-}
-
-start_ad_watcher() {
-  if [[ ! -d "$ADS_DIR" ]]; then
-    return 0
-  fi
-
-  (
-    while [[ ! -f "$STOP_FILE" ]]; do
-      if [[ -f "$AD_NOW_FILE" ]]; then
-        sleep 2
-        continue
-      fi
-
-      # Every 5 minutes pick a random ad if available
-      sleep 300
-      local ad_file
-      ad_file="$(find "$ADS_DIR" -type f \( -iname "*.mp4" -o -iname "*.mkv" \) 2>/dev/null | shuf -n 1 || true)"
-      if [[ -n "$ad_file" ]]; then
-        printf "%s\n" "$ad_file" > "$AD_NOW_FILE"
-      fi
-    done
-  ) &
-  AD_WATCHER_PID="$!"
-}
-
-# Core Channel Supervisor Loop
+# Channel Supervisor
 
 start_channel() {
-  local hls_dir="${ROOT_HLS_DIR}/live"
-  local width=1280
-  local height=720
-  local v_filter="scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2"
+  local width="${DEFAULT_SIZE%%:*}"
+  local height="${DEFAULT_SIZE##*:}"
+  local hls_dir="$ROOT_HLS_DIR/Prime"
+  local v_filter=""
 
-  mkdir -p "$hls_dir" "$CONTROL_DIR"
+  mkdir -p "$hls_dir"
+
+  v_filter="$(
+    build_video_filter \
+      "$width" \
+      "$height"
+  )"
+
+  echo -e \
+    "\033[0;34m[Prime]\033[0m Starting channel supervisor..."
+
+  echo "source: $MEDIA_PATH"
 
   (
     while [[ ! -f "$STOP_FILE" ]]; do
 
-      # 1. Commercial Interrupt Handler
+      # Commercial
+
       if [[ -s "$AD_NOW_FILE" ]]; then
-        local ad_path
-        ad_path="$(cat "$AD_NOW_FILE" 2>/dev/null || true)"
+        local ad_path=""
+
+        ad_path="$(
+          cat "$AD_NOW_FILE" 2>/dev/null || true
+        )"
 
         if [[ -n "$ad_path" && -f "$ad_path" ]]; then
           set_scroll_text "COMMERCIAL BREAK"
 
-          echo -e "\033[0;35m[ad]\033[0m Playing commercial: $ad_path"
+          echo -e \
+            "\033[0;35m[Prime]\033[0m Playing ad: $ad_path"
 
-          run_ffmpeg_hls "$ad_path" "$hls_dir" "$v_filter" "once" || true
-
-          rm -f "$AD_NOW_FILE"
-          set_scroll_text "$DEFAULT_SCROLL_TEXT"
-          continue
+          run_ffmpeg_hls \
+            "$ad_path" \
+            "$hls_dir" \
+            "$v_filter" \
+            "once" ||
+          true
         fi
+
         rm -f "$AD_NOW_FILE"
+
+        set_scroll_text "$DEFAULT_SCROLL_TEXT"
+
+        echo -e \
+          "\033[0;35m[Prime]\033[0m Returning to programming..."
+
+        continue
       fi
 
-      # 2. Main Content Loop
+      # Single File
+
+      if [[ -f "$MEDIA_PATH" ]]; then
+        local status=0
+        local rewind_status=0
+
+        echo -e \
+          "\033[0;34m[Prime]\033[0m Now playing: $MEDIA_PATH"
+
+        run_ffmpeg_hls \
+          "$MEDIA_PATH" \
+          "$hls_dir" \
+          "$v_filter" \
+          "once" ||
+        status="$?"
+
+        [[ -f "$STOP_FILE" ]] && break
+        [[ -s "$AD_NOW_FILE" ]] && continue
+
+        if (( status != 0 )); then
+          echo -e \
+            "\033[0;31m[Prime]\033[0m Encoder exited (status $status). Restarting in ${RESTART_DELAY_SECONDS}s..."
+
+          sleep "$RESTART_DELAY_SECONDS"
+          continue
+        fi
+
+        run_rewind_hls \
+          "$MEDIA_PATH" \
+          "$hls_dir" \
+          "$width" \
+          "$height" ||
+        rewind_status="$?"
+
+        [[ -f "$STOP_FILE" ]] && break
+        [[ -s "$AD_NOW_FILE" ]] && continue
+
+        if (( rewind_status != 0 )); then
+          echo -e \
+            "\033[0;31m[Prime]\033[0m Rewind slate exited (status $rewind_status). Restarting in ${RESTART_DELAY_SECONDS}s..."
+
+          sleep "$RESTART_DELAY_SECONDS"
+        fi
+
+        continue
+      fi
+
+      # Directory Playlist
+
       while IFS= read -r -d '' media_file; do
         [[ -f "$STOP_FILE" ]] && break
+        [[ -s "$AD_NOW_FILE" ]] && break
 
-        # Check if an ad was injected while reading media files
-        if [[ -s "$AD_NOW_FILE" ]]; then
-          break
-        fi
+        echo -e \
+          "\033[0;34m[Prime]\033[0m Now playing: $media_file"
 
-        if [[ -n "$NOW_PLAYING_TITLE" ]]; then
-          printf "%s\n" "$NOW_PLAYING_TITLE" > "$NOW_PLAYING_FILE"
-        else
-          title="$(basename "$media_file" | sed 's/\.[^.]*$//')"
-          printf "%s\n" "$title" > "$NOW_PLAYING_FILE"
-        fi
-
-        echo -e "\033[0;32m[Prime]\033[0m Now Playing: $media_file"
-
-        # If it's a single file, play video + rewind slate; if directory, stream through queue
-        if [[ -f "$MEDIA_PATH" ]]; then
-          run_ffmpeg_hls "$media_file" "$hls_dir" "$v_filter" "once" || true
-
-          if [[ ! -f "$STOP_FILE" && ! -s "$AD_NOW_FILE" ]]; then
-            run_rewind_hls "$media_file" "$hls_dir" "$width" "$height" || true
-          fi
-        else
-          run_ffmpeg_hls "$media_file" "$hls_dir" "$v_filter" "once" || true
-        fi
+        run_ffmpeg_hls \
+          "$media_file" \
+          "$hls_dir" \
+          "$v_filter" \
+          "once" ||
+        true
 
       done < <(list_media_files "$MEDIA_PATH")
 
-      sleep "$RESTART_DELAY_SECONDS"
     done
   ) &
 
   CHANNEL_PID="$!"
 }
 
-# Main Entrypoint
+
+# Main Entry Point
 
 main() {
-  parse_cli_args "$@"
-
-  trap 'cleanup $?' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-
   require_runtime
 
-  # Create control directory first to prevent PID file write errors
-  mkdir -p "$CONTROL_DIR"
+  mkdir -p "$ROOT_HLS_DIR"
   printf '%s\n' "$$" > "$BROADCAST_PID_FILE"
 
-  set_scroll_text "$DEFAULT_SCROLL_TEXT"
-  write_channel_manifest
+  if [[ -n "$NOW_PLAYING_TITLE" ]]; then
+    printf '%s\n' "$NOW_PLAYING_TITLE" > "$NOW_PLAYING_FILE"
+  else
+    rm -f "$NOW_PLAYING_FILE"
+  fi
 
+  set_scroll_text "$DEFAULT_SCROLL_TEXT"
+
+  trap 'cleanup 0' INT TERM EXIT
+
+  write_channel_manifest
   start_server
   wait_for_server
-
   start_quote_file
   start_ad_watcher
   start_channel
 
-  echo -e "\033[0;32m[+] Broadcast live at http://$BIND_ADDR:$PORT/index.html\033[0m"
-
-  # Keep main process alive
-  while [[ ! -f "$STOP_FILE" ]]; do
-    sleep 1
-  done
+  wait "$CHANNEL_PID" 2>/dev/null || true
 }
 
 main "$@"
