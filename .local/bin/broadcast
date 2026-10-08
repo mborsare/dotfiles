@@ -5,7 +5,7 @@ set -euo pipefail
 PORT="${PORT:-8090}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
 ROOT_HLS_DIR="${ROOT_HLS_DIR:-$HOME/cloud/broadcast-hls}"
-MEDIA="${1:-$HOME/Documents/Will-broadcast}"
+MEDIA="$HOME/Documents/Will-broadcast"
 LOGO="${LOGO_PATH:-$HOME/Documents/Prime/logotype.png}"
 SIZE="${DEFAULT_SIZE:-640:360}"
 FPS="${OUTPUT_FPS:-24}"
@@ -14,14 +14,26 @@ REWIND_SECONDS="${REWIND_SECONDS:-10}"
 FFMPEG="${FFMPEG:-ffmpeg}"
 FFPROBE="${FFPROBE:-ffprobe}"
 TITLE=""
+SHOW_RUNTIME=0
 
 # Arguments
-if [[ "$MEDIA" == "--help" || "$MEDIA" == "-h" ]]; then
-  echo 'usage: broadcast-lite [MOVIE_OR_DIRECTORY] [--now-playing TITLE]'
-  exit 0
-fi
-if [[ "${2:-}" == "--now-playing" ]]; then TITLE="${3:-}"; fi
-if [[ "${1:-}" == "--now-playing" ]]; then MEDIA="$HOME/Documents/Will-broadcast"; TITLE="${2:-}"; fi
+media_set=0
+while (( $# )); do
+  case "$1" in
+    --runtime) SHOW_RUNTIME=1; shift ;;
+    --now-playing)
+      if (( $# < 2 )); then echo '--now-playing requires a title' >&2; exit 2; fi
+      TITLE="$2"; shift 2 ;;
+    --help|-h)
+      echo 'usage: broadcast-lite [MOVIE_OR_DIRECTORY] [--now-playing TITLE] [--runtime]'
+      echo '  --runtime    Show VCR-style PLAY HH:MM:SS flag below the Prime logo (off by default)'
+      exit 0 ;;
+    --) shift; if (( $# == 1 && ! media_set )); then MEDIA="$1"; media_set=1; shift; else echo 'Expected one media path' >&2; exit 2; fi ;;
+    -*) echo "Unknown option: $1" >&2; exit 2 ;;
+    *) if (( media_set )); then echo 'Only one media path is allowed' >&2; exit 2; fi
+       MEDIA="$1"; media_set=1; shift ;;
+  esac
+done
 [[ -e "$MEDIA" ]] || { echo "No such media: $MEDIA" >&2; exit 1; }
 for binary in "$FFMPEG" "$FFPROBE" python3 curl; do
   command -v "$binary" >/dev/null || { echo "Missing: $binary" >&2; exit 1; }
@@ -32,11 +44,13 @@ OUT="$ROOT_HLS_DIR/Prime"
 WORK="$(mktemp -d /tmp/prime-lite.XXXXXXXX)"
 QUOTE_FILE="$WORK/quote.txt"
 TITLE_FILE="$WORK/title.txt"
+RUNTIME_FILE="$WORK/runtime.txt"
 LABEL_FILE="$WORK/label.txt"
 STAMP_FILE="$WORK/stamp.txt"
 LOG="${FFMPEG_LOG:-/tmp/prime-lite-ffmpeg.log}"
 SERVER_PID=""
 QUOTE_PID=""
+RUNTIME_PID=""
 ENCODER_PID=""
 SLATE_PID=""
 UPDATER_PID=""
@@ -47,10 +61,10 @@ cleanup() {
   (( STOPPING )) && return 0
   STOPPING=1
   trap - EXIT INT TERM
-  for pid in "$ENCODER_PID" "$SLATE_PID" "$UPDATER_PID" "$QUOTE_PID" "$SERVER_PID"; do
+  for pid in "$ENCODER_PID" "$SLATE_PID" "$UPDATER_PID" "$RUNTIME_PID" "$QUOTE_PID" "$SERVER_PID"; do
     if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
   done
-  for pid in "$ENCODER_PID" "$SLATE_PID" "$UPDATER_PID" "$QUOTE_PID" "$SERVER_PID"; do
+  for pid in "$ENCODER_PID" "$SLATE_PID" "$UPDATER_PID" "$RUNTIME_PID" "$QUOTE_PID" "$SERVER_PID"; do
     if [[ -n "$pid" ]]; then wait "$pid" 2>/dev/null || true; fi
   done
   rm -rf -- "$WORK"
@@ -65,9 +79,10 @@ mkdir -p "$ROOT_HLS_DIR"
 [[ "$OUT" != / && "$OUT" != "$HOME" ]] || exit 1
 rm -rf -- "$OUT"
 mkdir -p "$OUT"
-printf 'NQ -----   %s\n' "$(date +%H:%M)" > "$QUOTE_FILE"
+printf '%s  NQ -----\n' "$(date +%H:%M)" > "$QUOTE_FILE"
 printf '%s\n' "${TITLE:-NOW PLAYING}" > "$TITLE_FILE"
 printf '%s\n' '<< Rewind' > "$LABEL_FILE"
+printf '%s\n' 'PLAY  00:00:00' > "$RUNTIME_FILE"
 printf '%s\n' '00:00:00.000' > "$STAMP_FILE"
 printf '[{"number":"03","name":"PRIME","path":"/Prime/index.m3u8"}]\n' > "$ROOT_HLS_DIR/channels.json"
 
@@ -95,45 +110,83 @@ sleep 0.3
 kill -0 "$SERVER_PID" 2>/dev/null || { echo "Port $PORT unavailable" >&2; exit 1; }
 
 # Quote And Clock (atomic file replacement)
-QUOTE_URL="$QUOTE_URL" QUOTE_FILE="$QUOTE_FILE" python3 - <<'PY' &
-import json, os, time, urllib.request, math
+# Parse both direct quotes and OHLC priceSeries responses.
+QUOTE_URL="$QUOTE_URL" QUOTE_FILE="$QUOTE_FILE" python3 - <<'PYQUOTE' &
+import json, os, time, urllib.request, math, sys
 url = os.environ['QUOTE_URL'].rstrip('/') + '/NQ'
 path = os.environ['QUOTE_FILE']
 price = '-----'
 next_request = 0
+
+def extract(obj):
+    if isinstance(obj, dict):
+        for key in ('price', 'last', 'mark', 'close', 'c', 'value'):
+            if obj.get(key) is not None:
+                return obj[key]
+        for key in ('priceSeries', 'prices', 'data', 'series'):
+            series = obj.get(key)
+            if isinstance(series, list) and series:
+                return extract(series[-1])
+            if isinstance(series, dict):
+                return extract(series)
+        high = obj.get('hi', obj.get('high'))
+        low = obj.get('lo', obj.get('low'))
+        if high is not None and low is not None:
+            return (float(high) + float(low)) / 2
+    if isinstance(obj, list) and obj:
+        return extract(obj[-1])
+    return obj
+
 while True:
     now = time.time()
     if now >= next_request:
         next_request = now + 15
         try:
-            with urllib.request.urlopen(url, timeout=4) as response:
+            request = urllib.request.Request(url, headers={'User-Agent': 'PrimeLite/1.1', 'Accept': 'application/json'})
+            with urllib.request.urlopen(request, timeout=5) as response:
                 data = json.load(response)
-            value = next((data[k] for k in ('price','last','mark','close','c') if data.get(k) is not None), None)
-            if value is None:
-                series = data.get('priceSeries') or data.get('prices') or data.get('data') or []
-                last = series[-1]
-                value = next((last[k] for k in ('last','price','mark','close','c') if last.get(k) is not None), None) if isinstance(last,dict) else last
-            value = float(value)
-            if math.isfinite(value): price = str(round(value))
-        except Exception: pass  # keep the last known quote
+            value = float(extract(data))
+            if not math.isfinite(value):
+                raise ValueError('NQ quote is non-finite')
+            price = str(math.trunc(value))
+        except Exception as exc:
+            print(f'[Prime Lite] NQ fetch failed: {exc}', file=sys.stderr, flush=True)
     temp = path + '.new'
     with open(temp, 'w') as f:
-        f.write('NQ ' + price + '   ' + time.strftime('%H:%M') + '\n')
+        f.write(time.strftime('%H:%M') + '  NQ ' + price + '\n')
     os.replace(temp, path)
     time.sleep(1)
-PY
+PYQUOTE
 QUOTE_PID=$!
 
-# Filters: only scale, logo, and two text labels
+# Filters: scale, logo, clock/quote, title, runtime flag
 # Text files remain stable paths; the quote is replaced atomically.
-FONT=""
-if command -v fc-match >/dev/null 2>&1; then
-  FONT="$(fc-match -f '%{file}' 'sans' 2>/dev/null || true)"
+# Resolve Comic Shanns by installed family or filename, never silently choose sans.
+FONT="${COMIC_SHANNS_FONT:-}"
+if [[ -z "$FONT" ]] && command -v fc-list >/dev/null 2>&1; then
+  FONT="$(fc-list -f '%{family}\t%{file}\n' 2>/dev/null | awk -F '\t' 'tolower($1) ~ /comic ?shanns/ {print $2; exit}')"
+fi
+if [[ -z "$FONT" ]]; then
+  for candidate in \
+    "$HOME/.local/share/fonts/ComicShannsMonoNerdFont-Regular.otf" \
+    "$HOME/.local/share/fonts/ComicShannsMono-Regular.otf" \
+    "/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf" \
+    "/usr/local/share/fonts/ComicShannsMonoNerdFont-Regular.otf"; do
+    if [[ -f "$candidate" ]]; then FONT="$candidate"; break; fi
+  done
 fi
 FONT_OPT=""
-[[ -f "$FONT" ]] && FONT_OPT="fontfile='$FONT':"
+if [[ -f "$FONT" ]]; then
+  FONT_OPT="fontfile='$FONT':"
+  echo "[Prime Lite] Font: $FONT"
+else
+  # Fontconfig resolves this on hosts where the exact file path differs.
+  FONT_OPT="font='ComicShannsMono Nerd Font':"
+  echo '[Prime Lite] Comic Shanns file not found; requesting ComicShannsMono Nerd Font via fontconfig.' >&2
+fi
 BASE="fps=$FPS,scale=$SIZE:force_original_aspect_ratio=decrease,pad=${SIZE}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
 QUOTE_DRAW="drawtext=${FONT_OPT}textfile='$QUOTE_FILE':reload=1:x=w-tw-24:y=h-th-56:fontsize=12:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=3"
+RUNTIME_DRAW="drawtext=${FONT_OPT}textfile='$RUNTIME_FILE':reload=1:x=24:y=h-th-34:fontsize=12:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=3"
 TITLE_DRAW="drawtext=${FONT_OPT}textfile='$TITLE_FILE':x=w-tw-24:y=h-th-37:fontsize=11:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=3"
 
 # HLS Settings: epoch-numbered segments prevent overwriting old live segments.
@@ -148,8 +201,29 @@ AUDIO=( -c:a aac -b:a 96k -ar 44100 -ac 2 )
 play_movie() {
   local file="$1" status=0 name
   name="${TITLE:-$(basename "${file%.*}")}" 
-  printf '%s\n' "NOW PLAYING  $name" > "$TITLE_FILE"
+  printf '%s\n' "On now:  $name" > "$TITLE_FILE"
   echo "[Prime Lite] Playing: $name"
+  # VCR elapsed-time flag. Monotonic time avoids wall-clock jumps.
+  if (( SHOW_RUNTIME )); then
+  RUNTIME_FILE="$RUNTIME_FILE" python3 - <<'PYRUNTIME' &
+import os, time
+path = os.environ['RUNTIME_FILE']
+started = time.monotonic()
+previous = None
+while True:
+    seconds = int(time.monotonic() - started)
+    if seconds != previous:
+        hours, rem = divmod(seconds, 3600)
+        minutes, secs = divmod(rem, 60)
+        tmp = path + '.new'
+        with open(tmp, 'w') as f:
+            f.write(f'PLAY  {hours:02}:{minutes:02}:{secs:02}\n')
+        os.replace(tmp, path)
+        previous = seconds
+    time.sleep(.15)
+PYRUNTIME
+  RUNTIME_PID=$!
+  fi
   local graph="[0:v]$BASE[base];"
   local inputs=( -re -i "$file" )
   if [[ -f "$LOGO" ]]; then
@@ -158,13 +232,20 @@ play_movie() {
   else
     graph+="[base]null[decorated];"
   fi
-  graph+="[decorated]$QUOTE_DRAW,$TITLE_DRAW[v]"
+  if (( SHOW_RUNTIME )); then
+    graph+="[decorated]$QUOTE_DRAW,$TITLE_DRAW,$RUNTIME_DRAW[v]"
+  else
+    graph+="[decorated]$QUOTE_DRAW,$TITLE_DRAW[v]"
+  fi
   "$FFMPEG" -nostdin -hide_banner -loglevel warning "${inputs[@]}" \
     -filter_complex "$graph" -map '[v]' -map '0:a:0?' \
     "${VIDEO[@]}" "${AUDIO[@]}" "${HLS[@]}" >> "$LOG" 2>&1 &
   ENCODER_PID=$!
   wait "$ENCODER_PID" || status=$?
   ENCODER_PID=""
+  kill "$RUNTIME_PID" 2>/dev/null || true
+  wait "$RUNTIME_PID" 2>/dev/null || true
+  RUNTIME_PID=""
   return "$status"
 }
 
