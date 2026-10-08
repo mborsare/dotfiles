@@ -80,7 +80,7 @@ mkdir -p "$ROOT_HLS_DIR"
 rm -rf -- "$OUT"
 mkdir -p "$OUT"
 printf '%s  NQ -----\n' "$(date +%H:%M)" > "$QUOTE_FILE"
-printf '%s\n' "${TITLE:-NOW PLAYING}" > "$TITLE_FILE"
+printf '%s\n' "${TITLE:-On now:}" > "$TITLE_FILE"
 printf '%s\n' '<< Rewind' > "$LABEL_FILE"
 printf '%s\n' 'PLAY  00:00:00' > "$RUNTIME_FILE"
 printf '%s\n' '00:00:00.000' > "$STAMP_FILE"
@@ -107,7 +107,10 @@ Server((os.environ['BIND_ADDR'], int(os.environ['PORT'])), Handler).serve_foreve
 PY
 SERVER_PID=$!
 sleep 0.3
-kill -0 "$SERVER_PID" 2>/dev/null || { echo "Port $PORT unavailable" >&2; exit 1; }
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "Port $PORT unavailable (or server failed to start)" >&2
+  exit 1
+fi
 
 # Quote And Clock (atomic file replacement)
 # Parse both direct quotes and OHLC priceSeries responses.
@@ -161,28 +164,20 @@ QUOTE_PID=$!
 
 # Filters: scale, logo, clock/quote, title, runtime flag
 # Text files remain stable paths; the quote is replaced atomically.
-# Resolve Comic Shanns by installed family or filename, never silently choose sans.
+# Use the same fc-match font resolution as the known-working broadcaster.
 FONT="${COMIC_SHANNS_FONT:-}"
-if [[ -z "$FONT" ]] && command -v fc-list >/dev/null 2>&1; then
-  FONT="$(fc-list -f '%{family}\t%{file}\n' 2>/dev/null | awk -F '\t' 'tolower($1) ~ /comic ?shanns/ {print $2; exit}')"
+if [[ -z "$FONT" ]] && command -v fc-match >/dev/null 2>&1; then
+  FONT="$(fc-match -f '%{file}\n' 'ComicShannsMono Nerd Font' 2>/dev/null | head -n 1 || true)"
 fi
-if [[ -z "$FONT" ]]; then
-  for candidate in \
-    "$HOME/.local/share/fonts/ComicShannsMonoNerdFont-Regular.otf" \
-    "$HOME/.local/share/fonts/ComicShannsMono-Regular.otf" \
-    "/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf" \
-    "/usr/local/share/fonts/ComicShannsMonoNerdFont-Regular.otf"; do
-    if [[ -f "$candidate" ]]; then FONT="$candidate"; break; fi
-  done
+if [[ -z "$FONT" || ! -f "$FONT" ]]; then
+  FONT="/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf"
 fi
 FONT_OPT=""
 if [[ -f "$FONT" ]]; then
   FONT_OPT="fontfile='$FONT':"
   echo "[Prime Lite] Font: $FONT"
 else
-  # Fontconfig resolves this on hosts where the exact file path differs.
-  FONT_OPT="font='ComicShannsMono Nerd Font':"
-  echo '[Prime Lite] Comic Shanns file not found; requesting ComicShannsMono Nerd Font via fontconfig.' >&2
+  echo '[Prime Lite] Comic Shanns not found; using FFmpeg default font.' >&2
 fi
 BASE="fps=$FPS,scale=$SIZE:force_original_aspect_ratio=decrease,pad=${SIZE}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
 QUOTE_DRAW="drawtext=${FONT_OPT}textfile='$QUOTE_FILE':reload=1:x=w-tw-24:y=h-th-56:fontsize=12:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=3"
@@ -332,4 +327,6 @@ while true; do
     fi
   done
 done
+
+
 
