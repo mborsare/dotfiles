@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -59,6 +60,13 @@ AD_REQUEST_FILE="${AD_REQUEST_FILE:-/tmp/broadcast-ad-request.txt}"
 AD_NOW_FILE="${AD_NOW_FILE:-/tmp/broadcast-ad-now.txt}"
 SLEEP_FILE="${SLEEP_FILE:-/tmp/broadcast-sleep.txt}"
 
+FFMPEG_LOG="${FFMPEG_LOG:-/tmp/broadcast-ffmpeg.log}"
+SERVER_LOG="${SERVER_LOG:-/tmp/broadcast-server.log}"
+
+HLS_CLEAN_INTERVAL="${HLS_CLEAN_INTERVAL:-60}"
+HLS_MAX_SEGMENT_AGE_MINUTES="${HLS_MAX_SEGMENT_AGE_MINUTES:-5}"
+TMP_MAX_AGE_MINUTES="${TMP_MAX_AGE_MINUTES:-10}"
+
 SERVER_PID=""
 QUOTE_PID=""
 AD_PID=""
@@ -75,6 +83,8 @@ REWIND_LABEL_FILE="/tmp/broadcast-rewind-label-$$.txt"
 REWIND_TEXT_FILE="/tmp/broadcast-rewind-time-$$.txt"
 STOP_FILE="/tmp/broadcast-stop-$$"
 
+CLEANUP_STARTED=0
+
 
 # Help
 
@@ -85,19 +95,39 @@ usage: broadcast [MEDIA_FILE_OR_DIR] [--now-playing TITLE]
        broadcast sleep MINUTES
 
 With no media argument, plays ~/Documents/Will-broadcast.
-Use --now-playing "Wargames" to show a title below the time and NQ quote.
+
+Use --now-playing "Wargames" to show a title below
+the time and NQ quote.
 
 Defaults:
   640x360
   24 fps
   2-second HLS segments
-  brief analog glitch when a single movie ends
-  10-second VCR rewind between loops of a single file
-  brief hold on 00:00:00.000, then a 1-second Play > cue
+  analog glitch when a single movie ends
+  10-second VCR rewind between single-file loops
+  hold at 00:00:00.000
+  1-second Play > cue
+  periodic HLS segment cleanup
+  FFmpeg diagnostic logging
 
-Set DEFAULT_MEDIA_DIR, DEFAULT_SIZE, OUTPUT_FPS, HLS_TIME, REWIND_SECONDS,
-REWIND_RAMP_FRACTION, REWIND_GLITCH_SECONDS, REWIND_ZERO_HOLD_SECONDS,
-PLAY_SCREEN_SECONDS, PORT, or BIND_ADDR in the environment to override these settings.
+Useful environment overrides:
+  DEFAULT_MEDIA_DIR
+  DEFAULT_SIZE
+  OUTPUT_FPS
+  HLS_TIME
+  REWIND_SECONDS
+  REWIND_RAMP_FRACTION
+  REWIND_GLITCH_SECONDS
+  REWIND_ZERO_HOLD_SECONDS
+  PLAY_SCREEN_SECONDS
+  PORT
+  BIND_ADDR
+  FFMPEG_LOG
+  HLS_CLEAN_INTERVAL
+
+Logs:
+  /tmp/broadcast-ffmpeg.log
+  /tmp/broadcast-server.log
 EOF
   exit 0
 fi
@@ -119,14 +149,16 @@ if [[ "${1:-}" == "sleep" ]]; then
   read -r broadcast_pid < "$BROADCAST_PID_FILE"
 
   if ! [[ "$broadcast_pid" =~ ^[0-9]+$ ]]; then
-    echo "Invalid broadcast PID file: $BROADCAST_PID_FILE" >&2
+    echo "Invalid broadcast PID file" >&2
     exit 1
   fi
 
   broadcast_is_running() {
     local command_line
 
-    command_line="$(ps -p "$broadcast_pid" -o args= 2>/dev/null || true)"
+    command_line="$(
+      ps -p "$broadcast_pid" -o args= 2>/dev/null || true
+    )"
 
     [[ "$command_line" =~ (^|[[:space:]/])broadcast([[:space:]]|$) ]]
   }
@@ -146,12 +178,14 @@ if [[ "${1:-}" == "sleep" ]]; then
     if (( days > 0 )); then
       printf '%dd %02dh %02dm %02ds' \
         "$days" "$hours" "$minutes" "$seconds"
+
     elif (( hours > 0 )); then
       printf '%dh %02dm %02ds' \
         "$hours" "$minutes" "$seconds"
+
     elif (( minutes > 0 )); then
-      printf '%dm %02ds' \
-        "$minutes" "$seconds"
+      printf '%dm %02ds' "$minutes" "$seconds"
+
     else
       printf '%ds' "$seconds"
     fi
@@ -166,7 +200,7 @@ if [[ "${1:-}" == "sleep" ]]; then
 
   while (( $(date +%s) < end_epoch )); do
     if ! broadcast_is_running; then
-      echo "Broadcast stopped before the sleep timer ended" >&2
+      echo "Broadcast stopped before sleep timer ended" >&2
       exit 1
     fi
 
@@ -304,13 +338,13 @@ if [[ ! -e "$MEDIA_PATH" ]]; then
 fi
 
 
-# Helpers
+# Text Helpers
 
 set_scroll_text() {
   local text="${1:-}"
 
   if [[ -n "$text" ]]; then
-    printf "%s\n" "$text" > "$SCROLL_FILE"
+    printf '%s\n' "$text" > "$SCROLL_FILE"
   else
     : > "$SCROLL_FILE"
   fi
@@ -320,31 +354,99 @@ set_break_countdown_text() {
   local remaining="$1"
 
   if [[ -n "$DEFAULT_SCROLL_TEXT" ]]; then
-    set_scroll_text "COMMERCIAL BREAK IN ${remaining}  //  ${DEFAULT_SCROLL_TEXT}"
+    set_scroll_text \
+      "COMMERCIAL BREAK IN ${remaining}  //  ${DEFAULT_SCROLL_TEXT}"
   else
     set_scroll_text "COMMERCIAL BREAK IN ${remaining}"
   fi
 }
 
+
+# Encoder Shutdown
+
 kill_encoder() {
   local pid=""
+  local attempt
 
-  if [[ -s "$ENCODER_PID_FILE" ]]; then
-    read -r pid < "$ENCODER_PID_FILE" || true
+  [[ -s "$ENCODER_PID_FILE" ]] || return 0
 
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then
-      kill "$pid" 2>/dev/null || true
+  read -r pid < "$ENCODER_PID_FILE" || return 0
 
-      local attempt
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
 
-      for attempt in {1..50}; do
-        [[ ! -e "$ENCODER_PID_FILE" ]] && return 0
-        sleep 0.1
-      done
+  # Avoid killing an unrelated process if a stale PID was reused.
+  local command_line
+  command_line="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
 
-      kill -9 "$pid" 2>/dev/null || true
-    fi
+  if [[ "$command_line" != *ffmpeg* ]]; then
+    return 0
   fi
+
+  kill "$pid" 2>/dev/null || return 0
+
+  for attempt in {1..30}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+
+    sleep 0.1
+  done
+
+  # The supervisor owns wait/reaping and PID-file deletion.
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+}
+
+
+# HLS Garbage Collection
+
+clean_hls_orphans() {
+  local hls_dir="$ROOT_HLS_DIR/Prime"
+
+  [[ -d "$hls_dir" ]] || return 0
+
+  find "$hls_dir" \
+    -maxdepth 1 \
+    -type f \
+    -name 'seg_*.ts' \
+    -mmin "+$HLS_MAX_SEGMENT_AGE_MINUTES" \
+    -delete 2>/dev/null || true
+}
+
+start_hls_cleaner() {
+  (
+    while [[ ! -f "$STOP_FILE" ]]; do
+      clean_hls_orphans
+
+      sleep "$HLS_CLEAN_INTERVAL"
+    done
+  ) &
+
+  TIMER_PID="$!"
+}
+
+
+# Temporary File Garbage Collection
+
+clean_old_tmp() {
+  local pattern
+
+  for pattern in \
+    'broadcast-quotes-*' \
+    'broadcast-now-playing-*' \
+    'broadcast-scroll-*' \
+    'broadcast-rewind-label-*' \
+    'broadcast-rewind-time-*' \
+    'broadcast-stop-*'
+  do
+    find /tmp \
+      -maxdepth 1 \
+      -type f \
+      -name "$pattern" \
+      -mmin "+$TMP_MAX_AGE_MINUTES" \
+      -delete 2>/dev/null || true
+  done
 }
 
 
@@ -360,7 +462,7 @@ require_runtime() {
     fi
   done
 
-  if [[ ${#missing[@]} -gt 0 ]]; then
+  if (( ${#missing[@]} > 0 )); then
     echo "Missing required app(s): ${missing[*]}" >&2
     exit 1
   fi
@@ -375,14 +477,21 @@ require_runtime() {
 
 cleanup() {
   local status="$1"
+  local pid
+
+  if (( CLEANUP_STARTED )); then
+    return 0
+  fi
+
+  CLEANUP_STARTED=1
+
+  trap - EXIT INT TERM
 
   touch "$STOP_FILE"
 
-  echo -e "\n\033[0;31m[!] Cleanup...\033[0m"
+  printf '\n[!] Cleanup...\n'
 
   kill_encoder
-
-  local pid
 
   for pid in \
     "$CHANNEL_PID" \
@@ -397,7 +506,13 @@ cleanup() {
     fi
   done
 
-  rm -rf "$ROOT_HLS_DIR"
+  # Keep logs, but remove generated broadcast output.
+  if [[ -n "$ROOT_HLS_DIR" &&
+        "$ROOT_HLS_DIR" != "/" &&
+        "$ROOT_HLS_DIR" != "$HOME" &&
+        "$ROOT_HLS_DIR" != "$HOME/cloud" ]]; then
+    rm -rf -- "$ROOT_HLS_DIR"
+  fi
 
   rm -f \
     "$STOP_FILE" \
@@ -409,8 +524,9 @@ cleanup() {
     "$AD_NOW_FILE"
 
   echo "[+] Broadcast stopped."
+  echo "[+] FFmpeg log: $FFMPEG_LOG"
 
-  return "$status"
+  exit "$status"
 }
 
 
@@ -422,7 +538,7 @@ start_server() {
   BIND_ADDR="$BIND_ADDR" \
   PORT="$PORT" \
   ROOT_HLS_DIR="$ROOT_HLS_DIR" \
-  python3 - >/tmp/broadcast-server.log 2>&1 <<'PY' &
+  python3 - >"$SERVER_LOG" 2>&1 <<'PY' &
 import http.server
 import os
 
@@ -469,15 +585,19 @@ PY
   SERVER_PID="$!"
 }
 
+
+# Server Readiness
+
 wait_for_server() {
   local check_addr="$BIND_ADDR"
+  local i
 
-  if [[ "$check_addr" == "0.0.0.0" || "$check_addr" == "::" ]]; then
+  if [[ "$check_addr" == "0.0.0.0" ||
+        "$check_addr" == "::" ]]; then
     check_addr="127.0.0.1"
   fi
 
   local url="http://$check_addr:$PORT/channels.json"
-  local i
 
   for i in {1..50}; do
     if curl -sf --max-time 1 "$url" >/dev/null 2>&1; then
@@ -485,20 +605,19 @@ wait_for_server() {
     fi
 
     if [[ -n "$SERVER_PID" ]] &&
-       ! kill -0 "$SERVER_PID" 2>/dev/null
-    then
+       ! kill -0 "$SERVER_PID" 2>/dev/null; then
       echo "[error] Web server exited before it was reachable." >&2
-      cat /tmp/broadcast-server.log >&2 2>/dev/null || true
-      exit 1
+      cat "$SERVER_LOG" >&2 2>/dev/null || true
+      return 1
     fi
 
     sleep 0.1
   done
 
   echo "[error] Web server did not become reachable at $url" >&2
-  cat /tmp/broadcast-server.log >&2 2>/dev/null || true
+  cat "$SERVER_LOG" >&2 2>/dev/null || true
 
-  exit 1
+  return 1
 }
 
 
@@ -573,8 +692,11 @@ except Exception:
     out="-----"
   fi
 
-  printf "%s" "$out"
+  printf '%s' "$out"
 }
+
+
+# Quote Worker
 
 start_quote_file() {
   (
@@ -592,7 +714,7 @@ start_quote_file() {
         next_quote_refresh=$((now_epoch + QUOTE_REFRESH_SECONDS))
       fi
 
-      printf "%s  NQ %s\n" \
+      printf '%s  NQ %s\n' \
         "$current_time" \
         "$nq_now" \
         > "$QUOTE_FILE"
@@ -623,7 +745,9 @@ start_ad_watcher() {
       local delay=""
       local ad_path=""
 
-      IFS=$'\t' read -r delay ad_path < "$AD_REQUEST_FILE" || true
+      IFS=$'\t' read -r delay ad_path \
+        < "$AD_REQUEST_FILE" || true
+
       rm -f "$AD_REQUEST_FILE"
 
       if ! [[ "$delay" =~ ^[0-9]+$ ]]; then
@@ -637,7 +761,8 @@ start_ad_watcher() {
 
       local remaining="$delay"
 
-      while [[ "$remaining" -gt 0 && ! -f "$STOP_FILE" ]]; do
+      while [[ "$remaining" -gt 0 &&
+               ! -f "$STOP_FILE" ]]; do
         set_break_countdown_text "$remaining"
 
         sleep 1
@@ -649,12 +774,11 @@ start_ad_watcher() {
         break
       fi
 
-      printf "%s\n" "$ad_path" > "$AD_NOW_FILE"
+      printf '%s\n' "$ad_path" > "$AD_NOW_FILE"
 
       set_scroll_text "COMMERCIAL BREAK"
 
-      echo -e \
-        "\033[0;35m[ad]\033[0m Starting commercial: $ad_path"
+      echo "[ad] Starting commercial: $ad_path"
 
       kill_encoder
 
@@ -834,6 +958,8 @@ build_video_filter() {
     font_arg="fontfile='$font_path':"
   fi
 
+  # Base Video
+
   v_filter="fps=$OUTPUT_FPS,"
   v_filter+="setsar=1,"
   v_filter+="scale=$width:$height:"
@@ -903,7 +1029,7 @@ build_video_filter() {
   v_filter+="boxcolor=black@0.55:"
   v_filter+="boxborderw=$TICKER_BOX_PAD"
 
-  printf "%s" "$v_filter"
+  printf '%s' "$v_filter"
 }
 
 
@@ -923,9 +1049,12 @@ import sys
 
 try:
     value = float(sys.stdin.read().strip())
+
     if not math.isfinite(value) or value < 0:
         raise ValueError
+
     print(int(round(value * 1000)))
+
 except Exception:
     print(0)
 '
@@ -951,6 +1080,34 @@ PY
 }
 
 
+# FFmpeg Logging
+
+log_encoder_start() {
+  local mode="$1"
+  local source="$2"
+
+  {
+    echo
+    echo "=================================================="
+    echo "Date: $(date -Is)"
+    echo "Mode: $mode"
+    echo "Source: $source"
+    echo "=================================================="
+  } >> "$FFMPEG_LOG"
+}
+
+log_encoder_exit() {
+  local mode="$1"
+  local status="$2"
+
+  {
+    echo "[encoder] $mode exited with status $status"
+    echo "[encoder] $(date -Is)"
+    echo
+  } >> "$FFMPEG_LOG"
+}
+
+
 # HLS Encoder
 
 run_ffmpeg_hls() {
@@ -960,15 +1117,20 @@ run_ffmpeg_hls() {
   local loop_mode="$4"
 
   local loop_args=()
+  local encoder_pid=""
+  local watchdog_pid=""
+  local status=0
 
   if [[ "$loop_mode" == "loop" ]]; then
     loop_args=(-stream_loop -1)
   fi
 
+  log_encoder_start "media" "$media_file"
+
   "$FFMPEG" \
     -nostdin \
     -hide_banner \
-    -loglevel warning \
+    -loglevel info \
     -re \
     "${loop_args[@]}" \
     -fflags +genpts+discardcorrupt \
@@ -1001,13 +1163,14 @@ run_ffmpeg_hls() {
       delete_segments+omit_endlist+program_date_time+independent_segments \
     -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
     -hls_segment_filename "$hls_dir/seg_%d.ts" \
-    "$hls_dir/index.m3u8" &
+    "$hls_dir/index.m3u8" \
+    >> "$FFMPEG_LOG" 2>&1 &
 
-  local encoder_pid="$!"
-  local status=0
-  local watchdog_pid=""
+  encoder_pid="$!"
 
   printf '%s\n' "$encoder_pid" > "$ENCODER_PID_FILE"
+
+  # Encoder Watchdog
 
   (
     local started=""
@@ -1018,8 +1181,8 @@ run_ffmpeg_hls() {
     started="$(date +%s)"
 
     while kill -0 "$encoder_pid" 2>/dev/null &&
-          [[ ! -f "$STOP_FILE" ]]
-    do
+          [[ ! -f "$STOP_FILE" ]]; do
+
       sleep 5
 
       now="$(date +%s)"
@@ -1032,16 +1195,14 @@ run_ffmpeg_hls() {
         mtime="$(
           stat -c %Y \
             "$hls_dir/index.m3u8" \
-            2>/dev/null ||
-          echo 0
+            2>/dev/null || echo 0
         )"
 
         age=$((now - mtime))
 
         if (( age > WATCHDOG_STALE_SECONDS )); then
-          echo -e \
-            "\033[0;31m[watchdog]\033[0m HLS stale for ${age}s; restarting encoder." \
-            >&2
+          echo "[watchdog] HLS stale for ${age}s; restarting." \
+            | tee -a "$FFMPEG_LOG" >&2
 
           kill "$encoder_pid" 2>/dev/null || true
 
@@ -1053,9 +1214,8 @@ run_ffmpeg_hls() {
         fi
 
       else
-        echo -e \
-          "\033[0;31m[watchdog]\033[0m Encoder produced no HLS after ${WATCHDOG_GRACE_SECONDS}s; restarting." \
-          >&2
+        echo "[watchdog] No HLS after grace period; restarting." \
+          | tee -a "$FFMPEG_LOG" >&2
 
         kill "$encoder_pid" 2>/dev/null || true
 
@@ -1077,9 +1237,13 @@ run_ffmpeg_hls() {
 
   rm -f "$ENCODER_PID_FILE"
 
+  log_encoder_exit "media" "$status"
+
   return "$status"
 }
 
+
+# Rewind HLS
 
 run_rewind_hls() {
   local media_file="$1"
@@ -1130,15 +1294,19 @@ run_rewind_hls() {
     font_arg="fontfile='$font_path':"
   fi
 
-  # A short, unmistakable analog static burst bridges the movie into the blue VCR slate.
-  # Keep it long enough to survive HLS/player timing, but still feel like a tape glitch.
-  # Text stays hidden during the glitch, then the transport screen appears cleanly.
+  # Analog Glitch And VCR Slate
+
   rewind_filter="noise=alls=100:allf=t+u:"
   rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
+
   rewind_filter+="eq=contrast=2.8:brightness=0.08:saturation=0:"
   rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
+
   rewind_filter+="hue=s=0:"
   rewind_filter+="enable='lt(t\,$REWIND_GLITCH_SECONDS)',"
+
+  # Transport Label
+
   rewind_filter+="drawtext=${font_arg}"
   rewind_filter+="textfile='$REWIND_LABEL_FILE':"
   rewind_filter+="reload=1:"
@@ -1147,6 +1315,9 @@ run_rewind_hls() {
   rewind_filter+="fontsize=$REWIND_LABEL_FONT_SIZE:"
   rewind_filter+="fontcolor=white:"
   rewind_filter+="enable='gte(t\,$REWIND_GLITCH_SECONDS)',"
+
+  # Rewind Timestamp
+
   rewind_filter+="drawtext=${font_arg}"
   rewind_filter+="textfile='$REWIND_TEXT_FILE':"
   rewind_filter+="reload=1:"
@@ -1169,13 +1340,14 @@ print(f"{sum(values):.3f}")
 PY
   )"
 
-  echo -e \
-    "\033[0;34m[Prime]\033[0m glitch (${REWIND_GLITCH_SECONDS}s) -> << Rewind (${REWIND_SECONDS}s) -> zero (${REWIND_ZERO_HOLD_SECONDS}s) -> Play > (${PLAY_SCREEN_SECONDS}s)"
+  echo "[Prime] glitch (${REWIND_GLITCH_SECONDS}s) -> << Rewind (${REWIND_SECONDS}s) -> zero (${REWIND_ZERO_HOLD_SECONDS}s) -> Play > (${PLAY_SCREEN_SECONDS}s)"
+
+  log_encoder_start "rewind" "$media_file"
 
   "$FFMPEG" \
     -nostdin \
     -hide_banner \
-    -loglevel warning \
+    -loglevel info \
     -re \
     -f lavfi \
     -i "color=c=$REWIND_BG_COLOR:s=${width}x${height}:r=$OUTPUT_FPS" \
@@ -1208,10 +1380,14 @@ PY
       delete_segments+omit_endlist+program_date_time+independent_segments \
     -hls_delete_threshold "$HLS_DELETE_THRESHOLD" \
     -hls_segment_filename "$hls_dir/seg_%d.ts" \
-    "$hls_dir/index.m3u8" &
+    "$hls_dir/index.m3u8" \
+    >> "$FFMPEG_LOG" 2>&1 &
 
   encoder_pid="$!"
+
   printf '%s\n' "$encoder_pid" > "$ENCODER_PID_FILE"
+
+  # Mechanical Rewind Timestamp Updater
 
   python3 - \
     "$REWIND_LABEL_FILE" \
@@ -1224,6 +1400,7 @@ PY
     "$PLAY_SCREEN_SECONDS" \
     "$STOP_FILE" \
     "$AD_NOW_FILE" <<'PY' &
+
 import os
 import sys
 import time
@@ -1255,22 +1432,27 @@ except Exception:
     play_seconds = 1.0
 
 ramp_fraction = min(0.49, max(0.01, ramp_fraction))
+
 stop_path = sys.argv[9]
 ad_path = sys.argv[10]
 
 
 def format_time(total_ms):
     total_ms = max(0, int(total_ms))
+
     hours, rem = divmod(total_ms, 3_600_000)
     minutes, rem = divmod(rem, 60_000)
     seconds, millis = divmod(rem, 1_000)
+
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
 def write_text_atomic(path, value):
     tmp = f"{path}.{os.getpid()}.tmp"
+
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(value + "\n")
+
     os.replace(tmp, path)
 
 
@@ -1278,42 +1460,71 @@ def write_time_atomic(value):
     write_text_atomic(text_path, format_time(value))
 
 
+def should_stop():
+    return (
+        os.path.exists(stop_path)
+        or os.path.exists(ad_path)
+    )
+
+
 write_text_atomic(label_path, "<< Rewind")
 write_time_atomic(duration_ms)
 
-# Let the analog glitch occupy the handoff from movie to transport screen.
+# Glitch handoff
+
 glitch_started = time.monotonic()
+
 while time.monotonic() - glitch_started < glitch_seconds:
-    if os.path.exists(stop_path) or os.path.exists(ad_path):
+    if should_stop():
         break
+
     time.sleep(0.01)
+
+
+# Mechanical Rewind
 
 started = time.monotonic()
 
-while True:
-    if os.path.exists(stop_path) or os.path.exists(ad_path):
-        break
-
+while not should_stop():
     elapsed = time.monotonic() - started
     fraction = min(1.0, elapsed / rewind_seconds)
 
-    # Mechanical rewind profile:
-    # spool up -> steady motor speed -> spool down.
-    # The timestamp movement follows the motor's speed, rather than
-    # moving linearly from the first frame to the last.
+    # Spool up -> constant speed -> spool down
+
     r = ramp_fraction
     max_speed = 1.0 / (1.0 - r)
 
     if fraction < r:
-        progress = 0.5 * (max_speed / r) * fraction * fraction
+        progress = (
+            0.5
+            * (max_speed / r)
+            * fraction
+            * fraction
+        )
+
     elif fraction <= 1.0 - r:
-        progress = (0.5 * max_speed * r) + max_speed * (fraction - r)
+        progress = (
+            (0.5 * max_speed * r)
+            + max_speed * (fraction - r)
+        )
+
     else:
         tail = 1.0 - fraction
-        progress = 1.0 - 0.5 * (max_speed / r) * tail * tail
+
+        progress = (
+            1.0
+            - 0.5
+            * (max_speed / r)
+            * tail
+            * tail
+        )
 
     progress = min(1.0, max(0.0, progress))
-    remaining = round(duration_ms * (1.0 - progress))
+
+    remaining = round(
+        duration_ms * (1.0 - progress)
+    )
+
     write_time_atomic(remaining)
 
     if fraction >= 1.0:
@@ -1321,24 +1532,40 @@ while True:
 
     time.sleep(0.025)
 
-# The rewind must visibly land on zero before the transport changes state.
-write_time_atomic(0)
 
-zero_started = time.monotonic()
-while time.monotonic() - zero_started < zero_hold_seconds:
-    if os.path.exists(stop_path) or os.path.exists(ad_path):
-        break
-    time.sleep(0.025)
+# Hold At Zero
 
-if not os.path.exists(stop_path) and not os.path.exists(ad_path):
-    # Same blue screen and same zero stamp; only the transport state changes.
+if not should_stop():
+    write_time_atomic(0)
+
+    zero_started = time.monotonic()
+
+    while (
+        time.monotonic() - zero_started
+        < zero_hold_seconds
+    ):
+        if should_stop():
+            break
+
+        time.sleep(0.025)
+
+
+# Play Cue
+
+if not should_stop():
     write_text_atomic(label_path, "Play >")
+
     play_started = time.monotonic()
 
-    while time.monotonic() - play_started < play_seconds:
-        if os.path.exists(stop_path) or os.path.exists(ad_path):
+    while (
+        time.monotonic() - play_started
+        < play_seconds
+    ):
+        if should_stop():
             break
+
         time.sleep(0.025)
+
 PY
 
   updater_pid="$!"
@@ -1349,6 +1576,8 @@ PY
   wait "$updater_pid" 2>/dev/null || true
 
   rm -f "$ENCODER_PID_FILE"
+
+  log_encoder_exit "rewind" "$status"
 
   return "$status"
 }
@@ -1365,14 +1594,10 @@ start_channel() {
   mkdir -p "$hls_dir"
 
   v_filter="$(
-    build_video_filter \
-      "$width" \
-      "$height"
+    build_video_filter "$width" "$height"
   )"
 
-  echo -e \
-    "\033[0;34m[Prime]\033[0m Starting channel supervisor..."
-
+  echo "[Prime] Starting channel supervisor..."
   echo "source: $MEDIA_PATH"
 
   (
@@ -1390,23 +1615,20 @@ start_channel() {
         if [[ -n "$ad_path" && -f "$ad_path" ]]; then
           set_scroll_text "COMMERCIAL BREAK"
 
-          echo -e \
-            "\033[0;35m[Prime]\033[0m Playing ad: $ad_path"
+          echo "[Prime] Playing ad: $ad_path"
 
           run_ffmpeg_hls \
             "$ad_path" \
             "$hls_dir" \
             "$v_filter" \
-            "once" ||
-          true
+            "once" || true
         fi
 
         rm -f "$AD_NOW_FILE"
 
         set_scroll_text "$DEFAULT_SCROLL_TEXT"
 
-        echo -e \
-          "\033[0;35m[Prime]\033[0m Returning to programming..."
+        echo "[Prime] Returning to programming..."
 
         continue
       fi
@@ -1417,40 +1639,37 @@ start_channel() {
         local status=0
         local rewind_status=0
 
-        echo -e \
-          "\033[0;34m[Prime]\033[0m Now playing: $MEDIA_PATH"
+        echo "[Prime] Now playing: $MEDIA_PATH"
 
         run_ffmpeg_hls \
           "$MEDIA_PATH" \
           "$hls_dir" \
           "$v_filter" \
-          "once" ||
-        status="$?"
+          "once" || status="$?"
 
         [[ -f "$STOP_FILE" ]] && break
         [[ -s "$AD_NOW_FILE" ]] && continue
 
         if (( status != 0 )); then
-          echo -e \
-            "\033[0;31m[Prime]\033[0m Encoder exited (status $status). Restarting in ${RESTART_DELAY_SECONDS}s..."
+          echo "[Prime] Encoder exited ($status). Restarting in ${RESTART_DELAY_SECONDS}s..."
 
           sleep "$RESTART_DELAY_SECONDS"
           continue
         fi
 
+        # Rewind only after successful completion
+
         run_rewind_hls \
           "$MEDIA_PATH" \
           "$hls_dir" \
           "$width" \
-          "$height" ||
-        rewind_status="$?"
+          "$height" || rewind_status="$?"
 
         [[ -f "$STOP_FILE" ]] && break
         [[ -s "$AD_NOW_FILE" ]] && continue
 
         if (( rewind_status != 0 )); then
-          echo -e \
-            "\033[0;31m[Prime]\033[0m Rewind slate exited (status $rewind_status). Restarting in ${RESTART_DELAY_SECONDS}s..."
+          echo "[Prime] Rewind exited ($rewind_status). Restarting in ${RESTART_DELAY_SECONDS}s..."
 
           sleep "$RESTART_DELAY_SECONDS"
         fi
@@ -1464,15 +1683,13 @@ start_channel() {
         [[ -f "$STOP_FILE" ]] && break
         [[ -s "$AD_NOW_FILE" ]] && break
 
-        echo -e \
-          "\033[0;34m[Prime]\033[0m Now playing: $media_file"
+        echo "[Prime] Now playing: $media_file"
 
         run_ffmpeg_hls \
           "$media_file" \
           "$hls_dir" \
           "$v_filter" \
-          "once" ||
-        true
+          "once" || true
 
       done < <(list_media_files "$MEDIA_PATH")
 
@@ -1488,8 +1705,32 @@ start_channel() {
 main() {
   require_runtime
 
+  # Clean abandoned temporary files from older runs.
+
+  clean_old_tmp
+
+  # Initialize HLS output.
+
   mkdir -p "$ROOT_HLS_DIR"
+
+  # Refuse to overwrite a live broadcast's PID file.
+
+  if [[ -s "$BROADCAST_PID_FILE" ]]; then
+    local existing_pid=""
+    read -r existing_pid < "$BROADCAST_PID_FILE" || true
+
+    if [[ "$existing_pid" =~ ^[0-9]+$ ]] &&
+       kill -0 "$existing_pid" 2>/dev/null; then
+      echo "[error] Broadcast PID $existing_pid is already running." >&2
+      exit 1
+    fi
+  fi
+
   printf '%s\n' "$$" > "$BROADCAST_PID_FILE"
+
+  # Begin a fresh FFmpeg log for each broadcast.
+
+  : > "$FFMPEG_LOG"
 
   if [[ -n "$NOW_PLAYING_TITLE" ]]; then
     printf '%s\n' "$NOW_PLAYING_TITLE" > "$NOW_PLAYING_FILE"
@@ -1499,16 +1740,37 @@ main() {
 
   set_scroll_text "$DEFAULT_SCROLL_TEXT"
 
-  trap 'cleanup 0' INT TERM EXIT
+  # Clean shutdown on exit or interruption.
+  # Use the actual exit status for failures.
+
+  trap 'cleanup $?' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  # Start services.
 
   write_channel_manifest
+
   start_server
   wait_for_server
+
   start_quote_file
   start_ad_watcher
+
+  # Start cleanup only after runtime initialization.
+
+  start_hls_cleaner
+
+  # Start channel.
+
   start_channel
 
-  wait "$CHANNEL_PID" 2>/dev/null || true
+  wait "$CHANNEL_PID"
 }
 
+
+# Run
+
 main "$@"
+
+
