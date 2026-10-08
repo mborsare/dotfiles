@@ -751,6 +751,10 @@ for path in candidates:
                 ffprobe,
                 "-v",
                 "error",
+                "-analyzeduration",
+                "10000000",
+                "-probesize",
+                "10000000",
                 "-select_streams",
                 "v:0",
                 "-show_entries",
@@ -778,10 +782,36 @@ for path in candidates:
             sys.stdout.buffer.flush()
 
         else:
-            print(
-                f"[skip bad media] {path}",
-                file=sys.stderr,
+            # Tolerant fallback probe for damaged files
+            fallback = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-err_detect",
+                    "ignore_err",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=8,
             )
+            if fallback.returncode == 0:
+                good_count += 1
+                sys.stdout.buffer.write(
+                    str(path).encode("utf-8") + b"\0"
+                )
+                sys.stdout.buffer.flush()
+            else:
+                print(
+                    f"[skip bad media] {path}",
+                    file=sys.stderr,
+                )
 
     except Exception:
         print(
@@ -914,6 +944,7 @@ probe_media_duration_ms() {
 
   "$FFPROBE" \
     -v error \
+    -err_detect ignore_err \
     -show_entries format=duration \
     -of default=noprint_wrappers=1:nokey=1 \
     "$media_file" |
@@ -971,8 +1002,11 @@ run_ffmpeg_hls() {
     -loglevel warning \
     -re \
     "${loop_args[@]}" \
-    -fflags +genpts+discardcorrupt \
+    -analyzeduration 10000000 \
+    -probesize 10000000 \
+    -fflags +genpts+discardcorrupt+igndts \
     -err_detect ignore_err \
+    -max_interleave_delta 0 \
     -i "$media_file" \
     -map 0:v:0 \
     -map 0:a? \
@@ -1448,66 +1482,38 @@ start_channel() {
         rewind_status="$?"
 
         [[ -f "$STOP_FILE" ]] && break
-        [[ -s "$AD_NOW_FILE" ]] && continue
 
         if (( rewind_status != 0 )); then
           echo -e \
-            "\033[0;33m[Prime]\033[0m Rewind screen exited (status $rewind_status); restarting movie." \
-            >&2
-        else
-          echo -e \
-            "\033[0;34m[Prime]\033[0m Rewind complete. Restarting movie..."
+            "\033[0;31m[Prime]\033[0m Rewind slate exited (status $rewind_status). Restarting in ${RESTART_DELAY_SECONDS}s..."
+
+          sleep "$RESTART_DELAY_SECONDS"
         fi
 
         continue
       fi
 
-      # Media Folder
-
-      local media_file=""
-      local status=0
-      local media_count=0
+      # Directory Playlist
 
       while IFS= read -r -d '' media_file; do
-        ((media_count += 1))
-
         [[ -f "$STOP_FILE" ]] && break
         [[ -s "$AD_NOW_FILE" ]] && break
 
         echo -e \
           "\033[0;34m[Prime]\033[0m Now playing: $media_file"
 
-        status=0
-
         run_ffmpeg_hls \
           "$media_file" \
           "$hls_dir" \
           "$v_filter" \
           "once" ||
-        status="$?"
+        true
 
-        [[ -f "$STOP_FILE" ]] && break
-        [[ -s "$AD_NOW_FILE" ]] && break
+      done < <(list_media_files "$MEDIA_PATH" 2>/dev/null || true)
 
-        if (( status != 0 )); then
-          echo -e \
-            "\033[0;33m[Prime]\033[0m Media failed (status $status); skipping: $media_file" \
-            >&2
+      [[ -f "$STOP_FILE" ]] && break
 
-          sleep 1
-        fi
-
-      done < <(
-        list_media_files "$MEDIA_PATH"
-      )
-
-      if (( media_count == 0 )); then
-        echo -e \
-          "\033[0;31m[Prime]\033[0m No playable media. Retrying in 10s..." \
-          >&2
-
-        sleep 10
-      fi
+      sleep "$RESTART_DELAY_SECONDS"
     done
   ) &
 
@@ -1515,177 +1521,11 @@ start_channel() {
 }
 
 
-# Validation
-
-if ! [[ "$OUTPUT_FPS" =~ ^[0-9]+$ ]] ||
-   (( OUTPUT_FPS < 24 ))
-then
-  echo "OUTPUT_FPS must be an integer of at least 24" >&2
-  exit 2
-fi
-
-if ! [[ "$HLS_TIME" =~ ^[0-9]+$ ]] ||
-   (( HLS_TIME < 1 ))
-then
-  echo "HLS_TIME must be a positive integer" >&2
-  exit 2
-fi
-
-if ! [[ "$REWIND_SECONDS" =~ ^[0-9]+$ ]] ||
-   (( REWIND_SECONDS < 1 ))
-then
-  echo "REWIND_SECONDS must be a positive integer" >&2
-  exit 2
-fi
-
-python3 - \
-  "$REWIND_GLITCH_SECONDS" \
-  "$REWIND_RAMP_FRACTION" \
-  "$REWIND_ZERO_HOLD_SECONDS" \
-  "$PLAY_SCREEN_SECONDS" <<'PY'
-import sys
-
-names = (
-    "REWIND_GLITCH_SECONDS",
-    "REWIND_RAMP_FRACTION",
-    "REWIND_ZERO_HOLD_SECONDS",
-    "PLAY_SCREEN_SECONDS",
-)
-
-values = []
-for name, raw in zip(names, sys.argv[1:]):
-    try:
-        value = float(raw)
-    except Exception:
-        raise SystemExit(f"{name} must be numeric")
-
-    if value < 0:
-        raise SystemExit(f"{name} must be zero or greater")
-
-    values.append(value)
-
-if not 0 < values[1] < 0.5:
-    raise SystemExit("REWIND_RAMP_FRACTION must be greater than 0 and less than 0.5")
-
-if values[3] <= 0:
-    raise SystemExit("PLAY_SCREEN_SECONDS must be greater than 0")
-PY
+# Main Execution Entry Point
 
 require_runtime
 
-
-# Port Cleanup
-
-if command -v fuser >/dev/null 2>&1; then
-  if fuser "$PORT/tcp" >/dev/null 2>&1; then
-    echo "[!] Clearing stale listener on $BIND_ADDR:$PORT..."
-
-    fuser -k "$PORT/tcp" >/dev/null 2>&1 || true
-
-    for _ in {1..20}; do
-      if ! fuser "$PORT/tcp" >/dev/null 2>&1; then
-        break
-      fi
-
-      sleep 0.1
-    done
-  fi
-fi
-
-
-# Port Check
-
-python3 - "$BIND_ADDR" "$PORT" <<'PY'
-import socket
-import sys
-
-address = sys.argv[1]
-port = int(sys.argv[2])
-
-family = (
-    socket.AF_INET6
-    if ":" in address
-    else socket.AF_INET
-)
-
-try:
-    with socket.socket(
-        family,
-        socket.SOCK_STREAM,
-    ) as sock:
-        sock.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_REUSEADDR,
-            1,
-        )
-
-        sock.bind(
-            (
-                address,
-                port,
-            )
-        )
-
-except OSError as exc:
-    raise SystemExit(
-        f"Cannot bind {address}:{port}: {exc}"
-    )
-PY
-
-
-# Existing Broadcast
-
-if [[ -s "$BROADCAST_PID_FILE" ]]; then
-  read -r previous_pid \
-    < "$BROADCAST_PID_FILE" || true
-
-  if [[ "$previous_pid" =~ ^[0-9]+$ ]] &&
-     kill -0 "$previous_pid" 2>/dev/null
-  then
-    echo \
-      "Broadcast is already running (PID $previous_pid)" \
-      >&2
-
-    exit 1
-  fi
-fi
-
-
-# Working Directory
-
-rm -rf "$ROOT_HLS_DIR"
 mkdir -p "$ROOT_HLS_DIR"
-
-printf '%s\n' "$$" > "$BROADCAST_PID_FILE"
-
-trap 'cleanup $?' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-rm -f \
-  "$STOP_FILE" \
-  "$QUOTE_FILE" \
-  "$NOW_PLAYING_FILE" \
-  "$SCROLL_FILE" \
-  "$REWIND_LABEL_FILE" \
-  "$REWIND_TEXT_FILE" \
-  "$AD_NOW_FILE"
-
-printf "%s\n" \
-  "$(date '+%H:%M')  NQ -----" \
-  > "$QUOTE_FILE"
-
-if [[ -n "$NOW_PLAYING_TITLE" ]]; then
-  printf 'Now playing: %s\n' \
-    "${NOW_PLAYING_TITLE//$'\n'/ }" \
-    > "$NOW_PLAYING_FILE"
-fi
-
-set_scroll_text "$DEFAULT_SCROLL_TEXT"
-
-
-# Start Services
-
 write_channel_manifest
 
 start_server
@@ -1695,108 +1535,10 @@ start_quote_file
 start_ad_watcher
 start_channel
 
+printf '%s\n' "$$" > "$BROADCAST_PID_FILE"
 
-# Wait For Stream
+trap 'cleanup 0' INT TERM EXIT
 
-echo "[*] Initializing streams..."
+echo -e "\033[0;32m[+] Broadcast live on http://$BIND_ADDR:$PORT/index.m3u8\033[0m"
 
-ready=0
-
-for _ in {1..120}; do
-  if [[ -f "$ROOT_HLS_DIR/Prime/index.m3u8" ]]; then
-    ready=1
-    break
-  fi
-
-  sleep 0.5
-done
-
-if [[ "$ready" -ne 1 ]]; then
-  echo \
-    "[error] Prime never produced index.m3u8" \
-    >&2
-
-  exit 1
-fi
-
-
-# Live
-
-echo -e \
-  "\n\033[1;32m------------------------------------------------\033[0m"
-
-echo -e \
-  "\033[1;32m    PRIME BROADCAST LIVE \033[0m"
-
-echo -e \
-  "\033[1;32m------------------------------------------------\033[0m"
-
-echo -e \
-  "\033[1mManifest:\033[0m http://localhost:$PORT/channels.json"
-
-echo ""
-
-echo "Source: $MEDIA_PATH"
-echo "http://localhost:$PORT/Prime/index.m3u8"
-
-echo ""
-
-echo "Ad trigger:"
-echo "./$(basename "$0") ad 45 /path/to/foo.mp4"
-
-echo "Sleep timer:"
-echo "./$(basename "$0") sleep 90"
-
-echo ""
-echo "Press Ctrl+C to stop."
-
-
-# Main Loop
-
-sleep 604800 &
-TIMER_PID="$!"
-
-while kill -0 "$TIMER_PID" 2>/dev/null; do
-
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo -e \
-      "\033[0;31m[server]\033[0m Web server died; restarting..." \
-      >&2
-
-    start_server
-    wait_for_server
-  fi
-
-  if ! kill -0 "$QUOTE_PID" 2>/dev/null; then
-    echo -e \
-      "\033[0;31m[quotes]\033[0m Quote worker died; restarting..." \
-      >&2
-
-    start_quote_file
-  fi
-
-  if ! kill -0 "$AD_PID" 2>/dev/null; then
-    echo -e \
-      "\033[0;31m[ads]\033[0m Ad watcher died; restarting..." \
-      >&2
-
-    start_ad_watcher
-  fi
-
-  if ! kill -0 "$CHANNEL_PID" 2>/dev/null; then
-    echo -e \
-      "\033[0;31m[Prime]\033[0m Channel supervisor died; restarting..." \
-      >&2
-
-    start_channel
-  fi
-
-  sleep 2
-done
-
-
-# Shutdown
-
-echo "[!] 7-day limit reached. Stopping broadcast."
-
-exit 0
+wait "$CHANNEL_PID" 2>/dev/null || true
