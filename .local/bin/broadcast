@@ -6,7 +6,7 @@ set -euo pipefail
 
 PORT="${PORT:-8090}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
-ROOT_HLS_DIR="${ROOT_HLS_DIR:-/tmp/broadcast-hls}"
+ROOT_HLS_DIR="${ROOT_HLS_DIR:-$HOME/cloud/broadcast-hls}"
 
 FFMPEG="${FFMPEG:-ffmpeg}"
 FFPROBE="${FFPROBE:-ffprobe}"
