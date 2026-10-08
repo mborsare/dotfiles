@@ -11,6 +11,7 @@ ADS_DIR="${ADS_DIR:-./ads}"
 QUOTES_FILE="${QUOTES_FILE:-./quotes.txt}"
 RESTART_DELAY_SECONDS="${RESTART_DELAY_SECONDS:-2}"
 DEFAULT_SCROLL_TEXT="${DEFAULT_SCROLL_TEXT:-LATE NIGHT BROADCAST /// RETRO CRT SIMULATION /// DIRECT-TO-TAPE STREAMING}"
+NOW_PLAYING_TITLE=""
 
 # State Files & Runtime Directories
 
@@ -38,6 +39,34 @@ log_warn() {
 
 log_err() {
   echo -e "\033[0;31m[ERROR]\033[0m $*"
+}
+
+parse_cli_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --now-playing)
+        if [[ -n "${2:-}" ]]; then
+          NOW_PLAYING_TITLE="$2"
+          shift 2
+        else
+          log_err "Option --now-playing requires an argument."
+          exit 1
+        fi
+        ;;
+      -p|--port)
+        PORT="$2"
+        shift 2
+        ;;
+      -*)
+        log_err "Unknown option: $1"
+        exit 1
+        ;;
+      *)
+        MEDIA_PATH="$1"
+        shift
+        ;;
+    esac
+  done
 }
 
 require_runtime() {
@@ -290,8 +319,12 @@ start_channel() {
           break
         fi
 
-        title="$(basename "$media_file" | sed 's/\.[^.]*$//')"
-        printf "%s\n" "$title" > "$NOW_PLAYING_FILE"
+        if [[ -n "$NOW_PLAYING_TITLE" ]]; then
+          printf "%s\n" "$NOW_PLAYING_TITLE" > "$NOW_PLAYING_FILE"
+        else
+          title="$(basename "$media_file" | sed 's/\.[^.]*$//')"
+          printf "%s\n" "$title" > "$NOW_PLAYING_FILE"
+        fi
 
         echo -e "\033[0;32m[Prime]\033[0m Now Playing: $media_file"
 
@@ -318,13 +351,16 @@ start_channel() {
 # Main Entrypoint
 
 main() {
+  parse_cli_args "$@"
+
   trap 'cleanup $?' EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
   require_runtime
 
-  mkdir -p "$ROOT_HLS_DIR"
+  # Create control directory first to prevent PID file write errors
+  mkdir -p "$CONTROL_DIR"
   printf '%s\n' "$$" > "$BROADCAST_PID_FILE"
 
   set_scroll_text "$DEFAULT_SCROLL_TEXT"
