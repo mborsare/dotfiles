@@ -5,328 +5,369 @@ set -euo pipefail
 PORT="${PORT:-8090}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
 ROOT_HLS_DIR="${ROOT_HLS_DIR:-$HOME/cloud/broadcast-hls}"
-MEDIA="$HOME/Documents/Will-broadcast"
-LOGO="${LOGO_PATH:-$HOME/Documents/Prime/logotype.png}"
-SIZE="${DEFAULT_SIZE:-640:360}"
-FPS="${OUTPUT_FPS:-24}"
-QUOTE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
+MEDIA_PATH="${DEFAULT_MEDIA_DIR:-$HOME/Documents/Will-broadcast}"
+LOGO_PATH="${LOGO_PATH:-$HOME/Documents/Prime/logotype.png}"
+DEFAULT_SIZE="${DEFAULT_SIZE:-640:360}"
+OUTPUT_FPS="${OUTPUT_FPS:-24}"
+QUOTE_BASE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
 REWIND_SECONDS="${REWIND_SECONDS:-10}"
 FFMPEG="${FFMPEG:-ffmpeg}"
 FFPROBE="${FFPROBE:-ffprobe}"
-TITLE=""
+COMIC_SHANNS_FONT="${COMIC_SHANNS_FONT:-}"
 SHOW_RUNTIME=0
+NOW_PLAYING_TITLE=""
+media_set=0
 
 # Arguments
-media_set=0
 while (( $# )); do
   case "$1" in
     --runtime) SHOW_RUNTIME=1; shift ;;
     --now-playing)
-      if (( $# < 2 )); then echo '--now-playing requires a title' >&2; exit 2; fi
-      TITLE="$2"; shift 2 ;;
+      (( $# >= 2 )) || { echo '--now-playing needs a title' >&2; exit 2; }
+      NOW_PLAYING_TITLE="$2"; shift 2 ;;
     --help|-h)
-      echo 'usage: broadcast-lite [MOVIE_OR_DIRECTORY] [--now-playing TITLE] [--runtime]'
-      echo '  --runtime    Show VCR-style PLAY HH:MM:SS flag below the Prime logo (off by default)'
+      echo 'usage: broadcast-lite [MOVIE_OR_DIRECTORY] [--runtime] [--now-playing TITLE]'
+      echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
       exit 0 ;;
-    --) shift; if (( $# == 1 && ! media_set )); then MEDIA="$1"; media_set=1; shift; else echo 'Expected one media path' >&2; exit 2; fi ;;
-    -*) echo "Unknown option: $1" >&2; exit 2 ;;
-    *) if (( media_set )); then echo 'Only one media path is allowed' >&2; exit 2; fi
-       MEDIA="$1"; media_set=1; shift ;;
+    --) shift; (( $# == 1 && ! media_set )) || exit 2; MEDIA_PATH="$1"; media_set=1; shift ;;
+    -*) echo "Unknown argument: $1" >&2; exit 2 ;;
+    *) (( ! media_set )) || { echo 'Only one media path is allowed' >&2; exit 2; }
+       MEDIA_PATH="$1"; media_set=1; shift ;;
   esac
 done
-[[ -e "$MEDIA" ]] || { echo "No such media: $MEDIA" >&2; exit 1; }
-for binary in "$FFMPEG" "$FFPROBE" python3 curl; do
-  command -v "$binary" >/dev/null || { echo "Missing: $binary" >&2; exit 1; }
+[[ -e "$MEDIA_PATH" ]] || { echo "Missing media: $MEDIA_PATH" >&2; exit 1; }
+for binary in "$FFMPEG" "$FFPROBE" python3; do
+  command -v "$binary" >/dev/null || { echo "Missing $binary" >&2; exit 1; }
 done
 
-# Runtime Files
-OUT="$ROOT_HLS_DIR/Prime"
-WORK="$(mktemp -d /tmp/prime-lite.XXXXXXXX)"
-QUOTE_FILE="$WORK/quote.txt"
-TITLE_FILE="$WORK/title.txt"
-RUNTIME_FILE="$WORK/runtime.txt"
-LABEL_FILE="$WORK/label.txt"
-STAMP_FILE="$WORK/stamp.txt"
-LOG="${FFMPEG_LOG:-/tmp/prime-lite-ffmpeg.log}"
-SERVER_PID=""
-QUOTE_PID=""
-RUNTIME_PID=""
-ENCODER_PID=""
-SLATE_PID=""
-UPDATER_PID=""
-STOPPING=0
+# Comic Shanns: working original broadcaster's exact lookup
+if [[ -z "$COMIC_SHANNS_FONT" ]] && command -v fc-match >/dev/null 2>&1; then
+  COMIC_SHANNS_FONT="$(fc-match -f '%{file}\n' 'ComicShannsMono Nerd Font' 2>/dev/null | head -n 1 || true)"
+fi
+if [[ ! -f "$COMIC_SHANNS_FONT" ]]; then
+  COMIC_SHANNS_FONT='/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf'
+fi
+[[ -f "$COMIC_SHANNS_FONT" ]] || COMIC_SHANNS_FONT=''
+export PORT BIND_ADDR ROOT_HLS_DIR MEDIA_PATH LOGO_PATH DEFAULT_SIZE OUTPUT_FPS
+export QUOTE_BASE_URL REWIND_SECONDS FFMPEG FFPROBE COMIC_SHANNS_FONT
+export SHOW_RUNTIME NOW_PLAYING_TITLE
 
-# Shutdown
-cleanup() {
-  (( STOPPING )) && return 0
-  STOPPING=1
-  trap - EXIT INT TERM
-  for pid in "$ENCODER_PID" "$SLATE_PID" "$UPDATER_PID" "$RUNTIME_PID" "$QUOTE_PID" "$SERVER_PID"; do
-    if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
-  done
-  for pid in "$ENCODER_PID" "$SLATE_PID" "$UPDATER_PID" "$RUNTIME_PID" "$QUOTE_PID" "$SERVER_PID"; do
-    if [[ -n "$pid" ]]; then wait "$pid" 2>/dev/null || true; fi
-  done
-  rm -rf -- "$WORK"
-}
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# Continuous Controller
+exec python3 - <<'PY'
+import http.server
+import json
+import math
+import os
+from pathlib import Path
+import random
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
 
-# Setup: delete only Prime's old output, not the cloud root
-: > "$LOG"
-mkdir -p "$ROOT_HLS_DIR"
-[[ "$OUT" != / && "$OUT" != "$HOME" ]] || exit 1
-rm -rf -- "$OUT"
-mkdir -p "$OUT"
-printf '%s  NQ -----\n' "$(date +%H:%M)" > "$QUOTE_FILE"
-printf '%s\n' "${TITLE:-On now:}" > "$TITLE_FILE"
-printf '%s\n' '<< Rewind' > "$LABEL_FILE"
-printf '%s\n' 'PLAY  00:00:00' > "$RUNTIME_FILE"
-printf '%s\n' '00:00:00.000' > "$STAMP_FILE"
-printf '[{"number":"03","name":"PRIME","path":"/Prime/index.m3u8"}]\n' > "$ROOT_HLS_DIR/channels.json"
+port = int(os.environ['PORT'])
+bind = os.environ['BIND_ADDR']
+root = Path(os.environ['ROOT_HLS_DIR']).expanduser()
+media = Path(os.environ['MEDIA_PATH']).expanduser()
+logo = Path(os.environ['LOGO_PATH']).expanduser()
+w, h = [int(x) for x in os.environ['DEFAULT_SIZE'].split(':')]
+fps = int(os.environ['OUTPUT_FPS'])
+rewind_secs = max(0.1, float(os.environ['REWIND_SECONDS']))
+ffmpeg = os.environ['FFMPEG']
+ffprobe = os.environ['FFPROBE']
+font = os.environ['COMIC_SHANNS_FONT']
+title_override = os.environ['NOW_PLAYING_TITLE']
+show_runtime = os.environ['SHOW_RUNTIME'] == '1'
+quote_url = os.environ['QUOTE_BASE_URL'].rstrip('/') + '/NQ'
+log_path = Path(os.environ.get('FFMPEG_LOG', '/tmp/prime-lite-ffmpeg.log'))
+out = root/'Prime'
+work = Path(tempfile.mkdtemp(prefix='prime-lite-'))
+stop = threading.Event()
+mode = ['movie']
+processes = []
 
-# Web Server
-BIND_ADDR="$BIND_ADDR" PORT="$PORT" ROOT_HLS_DIR="$ROOT_HLS_DIR" python3 - <<'PY' &
-import http.server, os
+if w % 2 or h % 2 or w < 2 or h < 2 or fps < 1:
+    raise SystemExit('DEFAULT_SIZE must have even positive dimensions; FPS >=1')
+
+def atomic(path, value):
+    new = path.with_suffix('.new')
+    new.write_text(value+'\n', encoding='utf-8')
+    os.replace(new, path)
+
+def esc(value):
+    return str(value).replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'").replace(',', '\\,')
+
+def draw(file, fontsize, x, y, box=True):
+    f = f"fontfile='{esc(font)}':" if font else ''
+    b = ':box=1:boxcolor=black@0.55:boxborderw=3' if box else ''
+    return f"drawtext={f}textfile='{esc(file)}':reload=1:x={x}:y={y}:fontsize={fontsize}:fontcolor=white{b}"
+
+def probe(path, entry):
+    result = subprocess.run([ffprobe, '-v','error','-show_entries',entry,
+        '-of','default=noprint_wrappers=1:nokey=1',str(path)],
+        capture_output=True, text=True, timeout=15)
+    return result.stdout.strip() if result.returncode == 0 else ''
+
+def fmt(ms):
+    sec, milli = divmod(max(0,int(ms)),1000)
+    minute, sec = divmod(sec,60)
+    hour, minute = divmod(minute,60)
+    return f'{hour:02}:{minute:02}:{sec:02}.{milli:03}'
+
+def extract(d):
+    if isinstance(d,dict):
+        for k in ('price','last','mark','close','c','value'):
+            if d.get(k) is not None: return d[k]
+        for k in ('priceSeries','prices','data','series'):
+            if d.get(k): return extract(d[k])
+        hi=d.get('hi',d.get('high'))
+        lo=d.get('lo',d.get('low'))
+        if hi is not None and lo is not None: return (float(hi)+float(lo))/2
+        raise ValueError('No price')
+    if isinstance(d,list): return extract(d[-1])
+    return d
+
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=os.environ['ROOT_HLS_DIR'], **kwargs)
+        super().__init__(*args, directory=str(root), **kwargs)
     def guess_type(self, path):
         if path.endswith('.m3u8'): return 'application/vnd.apple.mpegurl'
         if path.endswith('.ts'): return 'video/mp2t'
+        if path.endswith('.json'): return 'application/json'
         return super().guess_type(path)
     def end_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Access-Control-Allow-Origin','*')
+        self.send_header('Cache-Control','no-cache, no-store')
         super().end_headers()
     def log_message(self, *args): pass
 class Server(http.server.ThreadingHTTPServer):
-    allow_reuse_address = True
-Server((os.environ['BIND_ADDR'], int(os.environ['PORT'])), Handler).serve_forever()
+    allow_reuse_address=True
+    daemon_threads=True
+
+quote_file=work/'quote.txt'
+title_file=work/'title.txt'
+runtime_file=work/'runtime.txt'
+rewind_label=work/'rewind-label.txt'
+rewind_stamp=work/'rewind-stamp.txt'
+for file in (quote_file,title_file,runtime_file,rewind_label,rewind_stamp):
+    atomic(file,'')
+
+def quote_worker():
+    price='-----'
+    next_refresh=0
+    while not stop.is_set():
+        now=time.monotonic()
+        if now >= next_refresh:
+            next_refresh=now+15
+            try:
+                request=urllib.request.Request(quote_url,headers={'User-Agent':'PrimeLite/1.3'})
+                with urllib.request.urlopen(request,timeout=5) as response:
+                    value=float(extract(json.load(response)))
+                if math.isfinite(value): price=str(math.trunc(value))
+            except Exception as exc:
+                print(f'[Prime Lite] NQ: {exc}',file=sys.stderr,flush=True)
+        if mode[0]=='movie':
+            atomic(quote_file, time.strftime('%H:%M')+'  NQ '+price)
+        stop.wait(1)
+
+# Pre-normalize each program to identical MPEG-TS transport parameters.
+# One HLS encoder reads the concatenated bytes without closing stdin.
+transport_video = ['-c:v','mpeg2video','-q:v','4','-g',str(2*fps),
+                   '-pix_fmt','yuv420p']
+transport_audio = ['-c:a','mp2','-b:a','128k','-ar','48000','-ac','2']
+transport_output = ['-f','mpegts','-mpegts_flags','+resend_headers','pipe:1']
+
+def transport_movie(path):
+    has_audio='audio' in probe(path,'stream=codec_type')
+    cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','error','-re','-i',str(path)]
+    if not has_audio:
+        cmd+=['-re','-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
+    vf=(f'fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease,'
+        f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p')
+    cmd+=['-map','0:v:0','-map','0:a:0' if has_audio else '1:a:0',
+          '-vf',vf,'-af','aresample=async=1:first_pts=0',
+          *transport_video,*transport_audio]
+    if not has_audio: cmd+=['-shortest']
+    return cmd+transport_output
+
+def transport_rewind(duration):
+    cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','error','-re',
+         '-f','lavfi','-i',f'color=c=0x0000AA:s={w}x{h}:r={fps}',
+         '-re','-f','lavfi','-i','anullsrc=r=48000:cl=stereo',
+         '-map','0:v:0','-map','1:a:0','-t',str(duration),
+         *transport_video,*transport_audio,*transport_output]
+    return cmd
+
+def pump(cmd, encoder):
+    source=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=log_file,bufsize=0)
+    processes.append(source)
+    transferred=0
+    try:
+        while not stop.is_set():
+            data=source.stdout.read(65536)
+            if not data: break
+            if encoder.poll() is not None:
+                raise RuntimeError(f'HLS encoder exited: {encoder.returncode}')
+            encoder.stdin.write(data)
+            transferred+=len(data)
+        source.wait(timeout=5)
+        if source.returncode != 0 and not stop.is_set():
+            print(f'[Prime Lite] Source exited {source.returncode}',file=sys.stderr)
+    finally:
+        source.stdout.close()
+        if source.poll() is None: source.terminate()
+        source.wait()
+        processes.remove(source)
+    return transferred
+
+def source_files():
+    if media.is_file(): return [media]
+    files=[p for p in media.rglob('*') if p.is_file() and p.suffix.lower() in
+           ('.mp4','.mkv','.mov','.m4v','.webm')]
+    random.shuffle(files)
+    return files
+
+def movie(path, encoder):
+    mode[0]='movie'
+    atomic(title_file,'On now:  '+(title_override or path.stem))
+    atomic(rewind_label,'')
+    atomic(rewind_stamp,'')
+    print(f'[Prime Lite] Playing: {path.name}',flush=True)
+    duration_str=probe(path,'format=duration')
+    try: duration=float(duration_str)
+    except ValueError: duration=0
+    runtime_stop=threading.Event()
+    if show_runtime:
+        def runtime_worker():
+            started=time.monotonic()
+            while not runtime_stop.is_set():
+                s=int(time.monotonic()-started)
+                hours, rem=divmod(s,3600)
+                mins,secs=divmod(rem,60)
+                atomic(runtime_file,f'PLAY  {hours:02}:{mins:02}:{secs:02}')
+                runtime_stop.wait(1)
+        threading.Thread(target=runtime_worker,daemon=True).start()
+    try:
+        byte_count=pump(transport_movie(path),encoder)
+    finally:
+        runtime_stop.set()
+    return duration,byte_count
+
+def rewind(path, duration, encoder):
+    mode[0]='rewind'
+    atomic(quote_file,'')
+    atomic(title_file,'')
+    atomic(runtime_file,'')
+    atomic(rewind_label,'<< Rewind')
+    total=rewind_secs+1.35
+    ended=threading.Event()
+    def update_rewind():
+        started=time.monotonic()
+        while not ended.is_set():
+            elapsed=time.monotonic()-started
+            fraction=min(1,max(0,elapsed/rewind_secs))
+            r=.18
+            speed=1/(1-r)
+            progress=(.5*speed*fraction*fraction/r if fraction < r else
+                      .5*speed*r+speed*(fraction-r) if fraction <= 1-r else
+                      1-.5*speed*(1-fraction)**2/r)
+            atomic(rewind_stamp,fmt(round(duration*1000*(1-progress))))
+            if elapsed >= rewind_secs+.35:
+                atomic(rewind_label,'Play >')
+                atomic(rewind_stamp,'00:00:00.000')
+            ended.wait(.04)
+    thread=threading.Thread(target=update_rewind,daemon=True)
+    thread.start()
+    print('[Prime Lite] << Rewind -> 00:00:00.000 -> Play >',flush=True)
+    try:
+        pump(transport_rewind(total),encoder)
+    finally:
+        ended.set()
+        thread.join(timeout=1)
+
+def run():
+    root.mkdir(parents=True,exist_ok=True)
+    if out.exists(): shutil.rmtree(out)
+    out.mkdir(parents=True)
+    (root/'channels.json').write_text(json.dumps([{'number':'03','name':'PRIME','path':'/Prime/index.m3u8'}])+'\n')
+    files=source_files()
+    if not files: raise RuntimeError('No playable media found')
+    server=Server((bind,port),Handler)
+    thread=threading.Thread(target=server.serve_forever,daemon=True)
+    thread.start()
+    threading.Thread(target=quote_worker,daemon=True).start()
+    graph=f'[0:v]fps={fps},setpts=N/({fps}*TB),format=yuv420p[base];'
+    if logo.is_file():
+        # Pipe input is source 0; image 1 is a static, endlessly looped overlay.
+        graph+='[1:v]scale=55:-1,format=rgba[logo];[base][logo]overlay=24:H-h-58:shortest=0[decorated];'
+        inputs=['-loop','1','-framerate',str(fps),'-i',str(logo)]
+    else:
+        graph+='[base]null[decorated];'
+        inputs=[]
+    layers=[draw(quote_file,12,'w-tw-24','h-th-56'),
+            draw(title_file,11,'w-tw-24','h-th-37')]
+    if show_runtime: layers.append(draw(runtime_file,12,'24','h-th-34'))
+    layers.extend((draw(rewind_label,32,'(w-tw)/2','h/2-45',False),
+                   draw(rewind_stamp,24,'(w-tw)/2','h/2+8',False)))
+    graph+='[decorated]'+','.join(layers)+'[v]'
+    cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','warning',
+         '-fflags','+genpts+discardcorrupt','-f','mpegts','-i','pipe:0',*inputs,
+         '-filter_complex',graph,'-map','[v]','-map','0:a:0',
+         '-af','asetpts=N/SR/TB',
+         '-c:v','libx264','-preset','veryfast','-profile:v','main',
+         '-b:v','1000k','-maxrate','1300k','-bufsize','2600k',
+         '-g',str(fps*2),'-keyint_min',str(fps*2),'-sc_threshold','0',
+         '-pix_fmt','yuv420p',
+         '-c:a','aac','-b:a','96k','-ar','48000','-ac','2',
+         '-f','hls','-hls_time','2','-hls_list_size','6',
+         '-hls_start_number_source','epoch',
+         '-hls_flags','delete_segments+omit_endlist+independent_segments+program_date_time',
+         '-hls_delete_threshold','3','-hls_segment_filename',str(out/'seg_%d.ts'),
+         str(out/'index.m3u8')]
+    encoder=subprocess.Popen(cmd,stdin=subprocess.PIPE,stderr=log_file,bufsize=0)
+    processes.append(encoder)
+    print(f'[Prime Lite] http://{bind}:{port}/Prime/index.m3u8',flush=True)
+    print(f'[Prime Lite] Font: {font or "FFmpeg default"}',flush=True)
+    print(f'[Prime Lite] Continuous HLS encoder: PID {encoder.pid}',flush=True)
+    print(f'[Prime Lite] Log: {log_path}',flush=True)
+    try:
+        while not stop.is_set():
+            for path in files:
+                if stop.is_set(): break
+                duration, amount=movie(path,encoder)
+                if not amount: print(f'[Prime Lite] No transport data: {path}',file=sys.stderr)
+                if len(files)==1 and amount:
+                    rewind(path,duration,encoder)
+    finally:
+        stop.set()
+        server.shutdown()
+        encoder.stdin.close()
+
+def shutdown(signum,frame):
+    stop.set()
+    for proc in list(processes):
+        if proc.poll() is None: proc.terminate()
+
+signal.signal(signal.SIGINT,shutdown)
+signal.signal(signal.SIGTERM,shutdown)
+log_file=log_path.open('w')
+try:
+    run()
+except Exception as exc:
+    print(f'[Prime Lite] ERROR: {exc}',file=sys.stderr,flush=True)
+    try: print(log_path.read_text(errors='replace')[-4000:],file=sys.stderr)
+    except OSError: pass
+    raise SystemExit(1)
+finally:
+    stop.set()
+    for proc in list(processes):
+        if proc.poll() is None: proc.terminate()
+        try: proc.wait(timeout=3)
+        except subprocess.TimeoutExpired: proc.kill(); proc.wait()
+    log_file.close()
+    shutil.rmtree(work,ignore_errors=True)
 PY
-SERVER_PID=$!
-sleep 0.3
-if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-  echo "Port $PORT unavailable (or server failed to start)" >&2
-  exit 1
-fi
-
-# Quote And Clock (atomic file replacement)
-# Parse both direct quotes and OHLC priceSeries responses.
-QUOTE_URL="$QUOTE_URL" QUOTE_FILE="$QUOTE_FILE" python3 - <<'PYQUOTE' &
-import json, os, time, urllib.request, math, sys
-url = os.environ['QUOTE_URL'].rstrip('/') + '/NQ'
-path = os.environ['QUOTE_FILE']
-price = '-----'
-next_request = 0
-
-def extract(obj):
-    if isinstance(obj, dict):
-        for key in ('price', 'last', 'mark', 'close', 'c', 'value'):
-            if obj.get(key) is not None:
-                return obj[key]
-        for key in ('priceSeries', 'prices', 'data', 'series'):
-            series = obj.get(key)
-            if isinstance(series, list) and series:
-                return extract(series[-1])
-            if isinstance(series, dict):
-                return extract(series)
-        high = obj.get('hi', obj.get('high'))
-        low = obj.get('lo', obj.get('low'))
-        if high is not None and low is not None:
-            return (float(high) + float(low)) / 2
-    if isinstance(obj, list) and obj:
-        return extract(obj[-1])
-    return obj
-
-while True:
-    now = time.time()
-    if now >= next_request:
-        next_request = now + 15
-        try:
-            request = urllib.request.Request(url, headers={'User-Agent': 'PrimeLite/1.1', 'Accept': 'application/json'})
-            with urllib.request.urlopen(request, timeout=5) as response:
-                data = json.load(response)
-            value = float(extract(data))
-            if not math.isfinite(value):
-                raise ValueError('NQ quote is non-finite')
-            price = str(math.trunc(value))
-        except Exception as exc:
-            print(f'[Prime Lite] NQ fetch failed: {exc}', file=sys.stderr, flush=True)
-    temp = path + '.new'
-    with open(temp, 'w') as f:
-        f.write(time.strftime('%H:%M') + '  NQ ' + price + '\n')
-    os.replace(temp, path)
-    time.sleep(1)
-PYQUOTE
-QUOTE_PID=$!
-
-# Filters: scale, logo, clock/quote, title, runtime flag
-# Text files remain stable paths; the quote is replaced atomically.
-# Use the same fc-match font resolution as the known-working broadcaster.
-FONT="${COMIC_SHANNS_FONT:-}"
-if [[ -z "$FONT" ]] && command -v fc-match >/dev/null 2>&1; then
-  FONT="$(fc-match -f '%{file}\n' 'ComicShannsMono Nerd Font' 2>/dev/null | head -n 1 || true)"
-fi
-if [[ -z "$FONT" || ! -f "$FONT" ]]; then
-  FONT="/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf"
-fi
-FONT_OPT=""
-if [[ -f "$FONT" ]]; then
-  FONT_OPT="fontfile='$FONT':"
-  echo "[Prime Lite] Font: $FONT"
-else
-  echo '[Prime Lite] Comic Shanns not found; using FFmpeg default font.' >&2
-fi
-BASE="fps=$FPS,scale=$SIZE:force_original_aspect_ratio=decrease,pad=${SIZE}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
-QUOTE_DRAW="drawtext=${FONT_OPT}textfile='$QUOTE_FILE':reload=1:x=w-tw-24:y=h-th-56:fontsize=12:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=3"
-RUNTIME_DRAW="drawtext=${FONT_OPT}textfile='$RUNTIME_FILE':reload=1:x=24:y=h-th-34:fontsize=12:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=3"
-TITLE_DRAW="drawtext=${FONT_OPT}textfile='$TITLE_FILE':x=w-tw-24:y=h-th-37:fontsize=11:fontcolor=white:box=1:boxcolor=black@0.55:boxborderw=3"
-
-# HLS Settings: epoch-numbered segments prevent overwriting old live segments.
-HLS=( -f hls -hls_time 2 -hls_list_size 6 -hls_start_number_source epoch
-      -hls_flags 'delete_segments+omit_endlist+append_list+independent_segments+discont_start'
-      -hls_segment_filename "$OUT/seg_%d.ts" "$OUT/index.m3u8" )
-VIDEO=( -c:v libx264 -preset veryfast -b:v 1000k -maxrate 1300k -bufsize 2600k
-        -pix_fmt yuv420p -g "$((FPS * 2))" -keyint_min "$((FPS * 2))" -sc_threshold 0 )
-AUDIO=( -c:a aac -b:a 96k -ar 44100 -ac 2 )
-
-# Encode One Movie
-play_movie() {
-  local file="$1" status=0 name
-  name="${TITLE:-$(basename "${file%.*}")}" 
-  printf '%s\n' "On now:  $name" > "$TITLE_FILE"
-  echo "[Prime Lite] Playing: $name"
-  # VCR elapsed-time flag. Monotonic time avoids wall-clock jumps.
-  if (( SHOW_RUNTIME )); then
-  RUNTIME_FILE="$RUNTIME_FILE" python3 - <<'PYRUNTIME' &
-import os, time
-path = os.environ['RUNTIME_FILE']
-started = time.monotonic()
-previous = None
-while True:
-    seconds = int(time.monotonic() - started)
-    if seconds != previous:
-        hours, rem = divmod(seconds, 3600)
-        minutes, secs = divmod(rem, 60)
-        tmp = path + '.new'
-        with open(tmp, 'w') as f:
-            f.write(f'PLAY  {hours:02}:{minutes:02}:{secs:02}\n')
-        os.replace(tmp, path)
-        previous = seconds
-    time.sleep(.15)
-PYRUNTIME
-  RUNTIME_PID=$!
-  fi
-  local graph="[0:v]$BASE[base];"
-  local inputs=( -re -i "$file" )
-  if [[ -f "$LOGO" ]]; then
-    inputs+=( -loop 1 -framerate "$FPS" -i "$LOGO" )
-    graph+="[1:v]scale=55:-1,format=rgba[logo];[base][logo]overlay=24:H-h-58:shortest=1[decorated];"
-  else
-    graph+="[base]null[decorated];"
-  fi
-  if (( SHOW_RUNTIME )); then
-    graph+="[decorated]$QUOTE_DRAW,$TITLE_DRAW,$RUNTIME_DRAW[v]"
-  else
-    graph+="[decorated]$QUOTE_DRAW,$TITLE_DRAW[v]"
-  fi
-  "$FFMPEG" -nostdin -hide_banner -loglevel warning "${inputs[@]}" \
-    -filter_complex "$graph" -map '[v]' -map '0:a:0?' \
-    "${VIDEO[@]}" "${AUDIO[@]}" "${HLS[@]}" >> "$LOG" 2>&1 &
-  ENCODER_PID=$!
-  wait "$ENCODER_PID" || status=$?
-  ENCODER_PID=""
-  kill "$RUNTIME_PID" 2>/dev/null || true
-  wait "$RUNTIME_PID" 2>/dev/null || true
-  RUNTIME_PID=""
-  return "$status"
-}
-
-# Rewind Slate: a blue screen, mechanically eased countdown, zero, then Play >
-rewind_movie() {
-  local file="$1" ms duration status=0
-  duration="$("$FFPROBE" -v error -show_entries format=duration -of default=nw=1:nk=1 "$file" 2>/dev/null || echo 0)"
-  ms="$(python3 - "$duration" <<'PY'
-import sys
-try: print(max(0, round(float(sys.argv[1])*1000)))
-except: print(0)
-PY
-)"
-  printf '<< Rewind\n' > "$LABEL_FILE"
-  REWIND_SECONDS="$REWIND_SECONDS" STAMP_FILE="$STAMP_FILE" LABEL_FILE="$LABEL_FILE" MS="$ms" python3 - <<'PY' &
-import os, time
-length = max(.01, float(os.environ['REWIND_SECONDS']))
-total = int(os.environ['MS'])
-label = os.environ['LABEL_FILE']; path = os.environ['STAMP_FILE']
-def write(p, s):
-    tmp = p+'.new'
-    with open(tmp,'w') as f: f.write(s+'\n')
-    os.replace(tmp,p)
-def fmt(ms):
-    s, ms = divmod(max(0,ms),1000)
-    m, s = divmod(s,60)
-    h, m = divmod(m,60)
-    return f'{h:02}:{m:02}:{s:02}.{ms:03}'
-start = time.monotonic()
-while True:
-    t = min(1., (time.monotonic()-start)/length)
-    r = .18
-    speed = 1/(1-r)
-    progress = (.5*speed*t*t/r if t < r else
-                .5*speed*r+speed*(t-r) if t <= 1-r else
-                1-.5*speed*(1-t)*(1-t)/r)
-    write(path,fmt(round(total*(1-progress))))
-    if t >= 1: break
-    time.sleep(.04)
-write(path,fmt(0))
-time.sleep(.35)
-write(label,'Play >')
-PY
-  UPDATER_PID=$!
-  local slate_length
-  slate_length="$(python3 - "$REWIND_SECONDS" <<'PY'
-import sys
-print(float(sys.argv[1]) + 1.35)
-PY
-)"
-  "$FFMPEG" -nostdin -hide_banner -loglevel warning \
-    -re -f lavfi -i "color=c=0x0000AA:s=${SIZE/:/x}:r=$FPS" \
-    -re -f lavfi -i 'anullsrc=r=44100:cl=stereo' \
-    -t "$slate_length" -vf "drawtext=${FONT_OPT}textfile='$LABEL_FILE':reload=1:x=(w-tw)/2:y=h/2-45:fontsize=32:fontcolor=white,drawtext=${FONT_OPT}textfile='$STAMP_FILE':reload=1:x=(w-tw)/2:y=h/2+8:fontsize=24:fontcolor=white" \
-    -map 0:v -map 1:a "${VIDEO[@]}" "${AUDIO[@]}" "${HLS[@]}" >> "$LOG" 2>&1 &
-  SLATE_PID=$!
-  wait "$SLATE_PID" || status=$?
-  SLATE_PID=""
-  kill "$UPDATER_PID" 2>/dev/null || true
-  wait "$UPDATER_PID" 2>/dev/null || true
-  UPDATER_PID=""
-  return "$status"
-}
-
-# Programming Loop
-collect_media() {
-  if [[ -f "$MEDIA" ]]; then printf '%s\0' "$MEDIA"; return; fi
-  find "$MEDIA" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.webm' \) -print0
-}
-mapfile -d '' -t FILES < <(collect_media)
-(( ${#FILES[@]} )) || { echo 'No media files found' >&2; exit 1; }
-echo "[Prime Lite] http://$BIND_ADDR:$PORT/Prime/index.m3u8"
-echo "[Prime Lite] Log: $LOG"
-while true; do
-  for file in "${FILES[@]}"; do
-    if play_movie "$file"; then
-      if [[ -f "$MEDIA" ]]; then
-        rewind_movie "$file" || echo '[Prime Lite] Rewind failed; continuing.' >&2
-      fi
-    else
-      echo '[Prime Lite] FFmpeg failed. Recent errors:' >&2
-      tail -n 12 "$LOG" >&2
-      sleep 2
-    fi
-  done
-done
-
-
-
