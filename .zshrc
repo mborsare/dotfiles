@@ -239,3 +239,5 @@ battery_pct() {
 }
 
 PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~${vcs_info_msg_0_} %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
+
+dot() { git -C "$HOME" "$@"; }
