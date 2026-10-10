@@ -140,7 +140,6 @@ alias bins='cd "$HOME/.local/bin"'
 alias day="$HOME/day.sh"
 alias delete='rm -rv'
 alias docs='cd "$HOME/Documents"'
-alias dot='git --git-dir=$HOME/.dotfiles --work-tree=$HOME'
 alias drives='lsblk -f'
 alias edit='nvim'
 alias exe='$HOME/.local/bin/'
@@ -239,5 +238,6 @@ battery_pct() {
 }
 
 PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~${vcs_info_msg_0_} %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
+
 
 dot() { git -C "$HOME" "$@"; }
