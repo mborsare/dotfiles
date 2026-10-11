@@ -22,19 +22,15 @@ export CLICOLOR=1
 # macOS/BSD ls uses LSCOLORS.
 # Linux/GNU ls uses LS_COLORS.
 if [[ "$OSTYPE" == darwin* ]]; then
-  # Pick a random bright ANSI color letter for directories/symlinks/executables.
   # C = bright green, D = yellow, E = blue, F = magenta, G = cyan, H = white
   lsc_pool=(C D E F G H)
   LS_DIR_COL=${lsc_pool[$(( 1 + RANDOM % $#lsc_pool ))]}
   LS_LINK_COL=${lsc_pool[$(( 1 + RANDOM % $#lsc_pool ))]}
   LS_EXE_COL=${lsc_pool[$(( 1 + RANDOM % $#lsc_pool ))]}
 
-  # Order:
-  # dir link socket pipe exe block char suid sgid sticky writable-sticky writable
   export LSCOLORS="${LS_DIR_COL}x${LS_LINK_COL}xFxDx${LS_EXE_COL}xEgEdxbxgxcxd"
 
 elif [[ "$OSTYPE" == linux* ]]; then
-  # Linux does use LS_COLORS.
   file_pool=(31 32 33 34 35 36 37 91 92 93 94 95 96)
   LS_DIR_COL=${file_pool[$(( 1 + RANDOM % $#file_pool ))]}
   LS_LINK_COL=${file_pool[$(( 1 + RANDOM % $#file_pool ))]}
@@ -45,15 +41,13 @@ elif [[ "$OSTYPE" == linux* ]]; then
 fi
 
 # ── Tmux Auto-Attach ─────────────────────────────────────────────────────────
-if [[ -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]]; then
-  if tmux has-session -t main 2>/dev/null; then
-    exec tmux attach -t main
-  else
-    exec tmux new-session -s main -n Zsh
-  fi
+# One persistent session named main.
+# Ctrl+A, then C opens another tmux window with your current tmux config.
+if [[ -o interactive && -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]] && command -v tmux >/dev/null; then
+  exec tmux new-session -A -s main
 fi
 
-# ── Login banner ────────────────────────────────────────────────────────────
+# ── Login Banner ────────────────────────────────────────────────────────────
 if [[ -o interactive ]]; then
   if [[ -x "$HOME/.config/alacritty/random-palette.zsh" ]]; then
     "$HOME/.config/alacritty/random-palette.zsh"
@@ -61,43 +55,66 @@ if [[ -o interactive ]]; then
 
   clear
 
-  # 1. Curated "Safe" Palette
-  # Excludes vibrating reds and deep blues for better legibility on black.
+  # Curated safe palette.
   prime_colors=(39 45 51 81 87 118 121 159 214 208 141)
-  RANDOM_COL=$prime_colors[$(( 1 + RANDOM % $#prime_colors ))]
+  RANDOM_COL=${prime_colors[$(( 1 + RANDOM % $#prime_colors ))]}
 
-  # Start the random theme color.
-  printf "\033[38;5;${RANDOM_COL}m"
+  # ── PRIME Animated Logo ───────────────────────────────────────────────────
+  # Original ASCII preserved exactly.
+  prime_logo=(
+    '       ██▓███   ██▀███   ██▓ ███▄ ▄███▓▓█████'
+    '      ▓██░  ██▒▓██ ▒ ██▒▓██▒▓██▒▀█▀ ██▒▓█   ▀'
+    '      ▓██░ ██▓▒▓██ ░▄█ ▒▒██▒▓██    ▓██░▒███'
+    '      ▒██▄█▓▒ ▒▒██▀▀█▄  ░██░▒██    ▓██░▒██ ▒▓█  ▄'
+    '      ▒██▒ ░  ░░██▓ ▒██▒░██░▒██    ░██▒░▒████▒'
+    '      ▒▓▒ ░  ░░ ▒▓ ░▒▓░░▓  ░ ▒░    ░  ░░░ ▒░ ░'
+    '      ░▒ ░        ░▒ ░ ▒░ ▒ ░░  ░      ░ ░ ░  ░'
+    '      ░░          ░░   ░  ▒ ░░      ░      ░'
+    '                  ░      ░          ░      ░  ░'
+  )
 
-  cat <<'EOF'
+  # Reveal PRIME row by row.
+  printf '\n'
 
-      ██▓███   ██▀███   ██▓ ███▄ ▄███▓▓█████
-      ▓██░  ██▒▓██ ▒ ██▒▓██▒▓██▒▀█▀ ██▒▓█   ▀
-      ▓██░ ██▓▒▓██ ░▄█ ▒▒██▒▓██    ▓██░▒███
-      ▒██▄█▓▒ ▒▒██▀▀█▄  ░██░▒██    ▒██ ▒▓█  ▄
-      ▒██▒ ░  ░░██▓ ▒██▒░██░▒██▒    ░██▒░▒████▒
-      ▒▓▒░ ░  ░░ ▒▓ ░▒▓░░▓  ░ ▒░    ░  ░░░ ▒░ ░
-      ░▒ ░        ░▒ ░ ▒░ ▒ ░░  ░      ░ ░ ░  ░
-      ░░          ░░   ░  ▒ ░░      ░      ░
-                  ░      ░          ░      ░  ░
-
-      Cyber, art, and risk
-
-EOF
-
-  # Progress bar.
-  loader_width=45
-  for pct in 0 5 10 15 20 25 30 35 40 45 50 55 60 65 70 75 80 85 90 95 100; do
-    filled=$(( pct * loader_width / 100 ))
-    empty=$(( loader_width - filled ))
-    bar="$(printf '\033[38;5;%sm%*s\033[0m' "$RANDOM_COL" "$filled" '' | tr ' ' '#')"
-    gap="$(printf '%*s' "$empty" '' | tr ' ' '.')"
-    printf "\r\033[K      [%s%s] %3d%%" "$bar" "$gap" "$pct"
-    sleep 0.02
+  for line in "${prime_logo[@]}"; do
+    printf '\033[38;5;%sm%s\033[0m\n' "$RANDOM_COL" "$line"
+    sleep 0.045
   done
 
-  printf "\n\n"
+  # Sweep a bright glint across the original lettering.
+  # Move back to the start, redraw in place, and preserve alignment.
+  for ((pos=1; pos<=65; pos+=3)); do
+    printf '\033[%dA' "${#prime_logo[@]}"
 
+    for line in "${prime_logo[@]}"; do
+      for ((i=1; i<=${#line}; i++)); do
+        ch="${line[$i]}"
+
+        if (( i >= pos && i <= pos+4 )) && [[ "$ch" != ' ' ]]; then
+          printf '\033[97m%s' "$ch"
+        else
+          printf '\033[38;5;%sm%s' "$RANDOM_COL" "$ch"
+        fi
+      done
+
+      printf '\033[0m\033[K\n'
+    done
+
+    sleep 0.018
+  done
+
+  # Restore base color after the sweep.
+  printf '\033[%dA' "${#prime_logo[@]}"
+
+  for line in "${prime_logo[@]}"; do
+    printf '\033[38;5;%sm%s\033[0m\033[K\n' "$RANDOM_COL" "$line"
+  done
+
+  # Tagline.
+  printf '\n'
+  printf '\033[38;5;%sm      Cyber, art, and risk\033[0m\n\n' "$RANDOM_COL"
+
+  # ── Access Granted ────────────────────────────────────────────────────────
   bio_msg="Access granted. Have a nice day"
   yellow="\033[38;5;226m"
   reset="\033[0m"
@@ -113,12 +130,19 @@ EOF
   sleep 0.1
   printf "\r\033[K      %b%s%b\n" "$yellow" "$bio_msg" "$reset"
 
+  # ── Weather & Clock ───────────────────────────────────────────────────────
   weather_raw="$(curl -fsSL --max-time 2 'wttr.in/?format=%C+%t+%w' 2>/dev/null || true)"
-  printf "\n      \033[38;5;${RANDOM_COL}m%s\033[0m @ \033[38;5;245m%s\033[0m" "${weather_raw:-Weather unavailable}" "$(date '+%Y-%m-%d %H:%M:%S')"
+
+  printf "\n      \033[38;5;${RANDOM_COL}m%s\033[0m @ \033[38;5;245m%s\033[0m" \
+    "${weather_raw:-Weather unavailable}" \
+    "$(date '+%Y-%m-%d %H:%M:%S')"
+
+  # ── Hot Files ─────────────────────────────────────────────────────────────
   printf "\n\n      \033[38;5;${RANDOM_COL}m%s\033[0m\n" "Hot files"
 
   for dir in "$HOME" "$HOME/bin" "$HOME/.local/bin" "$HOME/scripts" "$HOME/Sites/mikeb.work"; do
     [[ -d "$dir" ]] || continue
+
     recent="$(find "$dir" -maxdepth 1 -type f -mtime -14 -print 2>/dev/null | sed "s#$HOME#~#" | sort | tail -5)"
     [[ -n "$recent" ]] || continue
 
@@ -171,27 +195,45 @@ alias scrap='${EDITOR:-nvim} -c "setlocal buftype=nofile bufhidden=wipe noswapfi
 alias stream='$HOME/stream.sh'
 alias x='exit'
 
-# OS-specific aliases.
+# ── OS-Specific Aliases ─────────────────────────────────────────────────────
 if [[ "$OSTYPE" == darwin* ]]; then
   alias br='brew'
   alias ls='ls -G'
   alias ll='ls -lahG'
   alias la='ls -laG'
   alias iplocal='ipconfig getifaddr en0'
+
 elif [[ "$OSTYPE" == linux* ]]; then
-  alias ls='ls --color=auto'
-  alias ll='ls -lah --color=auto'
-  alias la='ls -la --color=auto'
   alias iplocal="hostname -I | awk '{print \$1}'"
+
+  # Omarchy-style file listings.
+  # Human-readable sizes, permissions, dates, icons, directories first.
+  if command -v eza >/dev/null 2>&1; then
+    alias ls='eza -lh --group-directories-first --icons=auto'
+    alias ll='eza -lah --group-directories-first --icons=auto --git'
+    alias la='eza -lah --group-directories-first --icons=auto'
+    alias lsa='ls -a'
+    alias lt='eza --tree --level=2 --long --icons --git'
+    alias lta='lt -a'
+  else
+    alias ls='ls -lh --color=auto --group-directories-first'
+    alias ll='ls -lah --color=auto --group-directories-first'
+    alias la='ls -lah --color=auto --group-directories-first'
+    alias lsa='ls -a'
+    alias lt='ls -R --color=auto'
+    alias lta='ls -Ra --color=auto'
+  fi
 fi
 
+# ── Python Virtual Environments ─────────────────────────────────────────────
 unalias venv 2>/dev/null
+
 venv() {
   [[ -d venv ]] || python3 -m venv venv
   source venv/bin/activate
 }
 
-# ── Zsh Settings & Completion ────────────────────────────────────────────────
+# ── Zsh Settings & Completion ───────────────────────────────────────────────
 autoload -Uz colors && colors
 autoload -Uz compinit
 autoload -Uz vcs_info
@@ -215,10 +257,10 @@ _prime_vcs_precmd() {
 
 add-zsh-hook precmd _prime_vcs_precmd
 
-# -u ignores insecure completion dir warnings on your own box.
+# Ignore insecure completion directory warnings.
 compinit -u
 
-# Make Tab complete.
+# Tab completion.
 bindkey '^I' expand-or-complete
 
 setopt AUTO_CD
@@ -226,7 +268,27 @@ setopt AUTO_PUSHD
 setopt PROMPT_SUBST
 setopt PUSHD_IGNORE_DUPS
 
-# ── Prompt helpers ───────────────────────────────────────────────────────────
+# ── Omarchy Shell Navigation ────────────────────────────────────────────────
+# Linux only. Leave macOS shell behavior unchanged.
+if [[ "$OSTYPE" == linux* && -o interactive ]]; then
+
+  # Learn frequently visited directories.
+  # z project: jump to a known directory.
+  # zi: interactively choose a directory.
+  if command -v zoxide >/dev/null 2>&1; then
+    eval "$(zoxide init zsh)"
+  fi
+
+  # Fuzzy history and file searching.
+  # Ctrl+R: history search.
+  # Ctrl+T: file picker.
+  # Alt+C: directory picker.
+  if command -v fzf >/dev/null 2>&1; then
+    eval "$(fzf --zsh)"
+  fi
+fi
+
+# ── Prompt Helpers ───────────────────────────────────────────────────────────
 battery_pct() {
   if [[ "$OSTYPE" == darwin* ]]; then
     pmset -g batt 2>/dev/null | grep -Eo "[0-9]+%" | head -1 | cut -d% -f1
@@ -237,7 +299,9 @@ battery_pct() {
   fi
 }
 
+# ── PRIME Prompt ─────────────────────────────────────────────────────────────
 PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~${vcs_info_msg_0_} %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
 
-
+# ── Dotfiles ─────────────────────────────────────────────────────────────────
+unalias dot 2>/dev/null
 dot() { git -C "$HOME" "$@"; }
