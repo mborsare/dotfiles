@@ -30,7 +30,7 @@ while (( $# )); do
     --help|-h)
       echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--runtime] [--analog] [--now-playing TITLE]'
       echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
-      echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking drift.'
+      echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking errors.'
       exit 0 ;;
     --) shift; (( $# == 1 && ! media_set )) || exit 2; MEDIA_PATH="$1"; media_set=1; shift ;;
     -*) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -113,14 +113,30 @@ def draw(file, fontsize, x, y, box=True):
 def analog_filter():
     # Apply after the overlays so the entire broadcast looks recorded to tape.
     # Keep dimensions, frame rate, and timestamps intact for continuous HLS.
-    return ','.join((
+    base = ','.join((
         'gblur=sigma=0.45',
         'gblur=sigma=1.1:planes=6',
         'chromashift=cbh=2:crh=-2',
         'eq=contrast=1.04:brightness=0.015:saturation=0.82',
-        "pad=iw+8:ih:4:0:color=black,crop=iw-8:ih:x='4+2*sin(t*2.7)+sin(t*17)':y=0",
         'noise=alls=5:allf=t+u',
         'drawgrid=width=iw:height=2:thickness=1:color=black@0.07'))
+    # Sparse, non-periodic tracking losses: a few damaged scanlines slip
+    # sideways while the rest of the picture stays locked. Each event holds
+    # for several frames; no continuous whole-frame oscillation.
+    seed = random.randrange(1, 1000000)
+    def irregular(clock, salt):
+        return f'mod(abs(sin(({clock}+{seed}+{salt})*12.9898)*43758.5453),1)'
+    event = irregular('floor(t/0.23)', 0)
+    position = irregular('floor(t/0.23)', 71)
+    shift = irregular('floor(t/0.07)', 139)
+    band = max(2, min(h, 2 * round(h * 0.012)))
+    y = f'2*floor((H-{band})*(0.82+0.18*({position}))/2)'
+    crop_y = y.replace('H', 'ih')
+    return (base + ',split=2[tape_clean][tape_error];'
+            f'[tape_error]crop=iw:{band}:0:\'{crop_y}\','
+            f"pad=iw+32:ih:16:0:color=black,crop=iw-32:ih:x='16+12*(2*({shift})-1)':y=0,"
+            'noise=alls=32:allf=t+u[tape_band];'
+            f"[tape_clean][tape_band]overlay=x=0:y='{y}':enable='lt({event},0.035)'")
 
 def probe(path, entry):
     result = subprocess.run([ffprobe, '-v','error','-show_entries',entry,
