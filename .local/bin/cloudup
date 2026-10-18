@@ -11,11 +11,31 @@ if mount | grep -q "on $MOUNT "; then
   exit 0
 fi
 
-sshfs "$REMOTE" "$MOUNT" \
+# Keep SSHFS in foreground mode internally: macFUSE cannot fork after mounting.
+# The shell backgrounds it before macFUSE starts any threads.
+LOG_DIR="$HOME/Library/Logs"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/cloudup.log"
+nohup sshfs -f "$REMOTE" "$MOUNT" \
   -o reconnect \
   -o ServerAliveInterval=15 \
   -o ServerAliveCountMax=3 \
   -o defer_permissions \
-  -o volname=oldcloud
+  -o volname=oldcloud >"$LOG" 2>&1 &
+SSHFS_PID=$!
 
-echo "mounted cloud at $MOUNT"
+for ((attempt=0; attempt<60; attempt++)); do
+  if ! kill -0 "$SSHFS_PID" 2>/dev/null; then
+    echo "cloud mount failed; SSHFS output:" >&2
+    cat "$LOG" >&2
+    exit 1
+  fi
+  if mount | grep -q "on $MOUNT "; then
+    echo "mounted cloud at $MOUNT"
+    exit 0
+  fi
+  sleep 0.5
+done
+
+echo "cloud mount is still pending; see $LOG" >&2
+exit 1
