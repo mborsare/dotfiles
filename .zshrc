@@ -171,7 +171,7 @@ alias bins='cd "$HOME/.local/bin"'
 alias day="$HOME/day.sh"
 alias delete='rm -rv'
 alias docs='cd "$HOME/Documents"'
-alias dot='git --git-dir=$HOME/.dotfiles --work-tree=$HOME'
+alias dot='git --git-dir="$HOME/.local/share/dotfiles.git" --work-tree="$HOME"'
 alias ds='dot status -uno'
 alias drives='lsblk -f'
 alias edit='nvim'
