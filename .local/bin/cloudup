@@ -2,17 +2,32 @@
 set -euo pipefail
 
 MOUNT="$HOME/mnt/cloud"
+
+is_mounted() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    /sbin/mount | awk -v target="$MOUNT" '
+      index($0, " on " target " (") { found = 1 }
+      END { exit !found }
+    '
+  else
+    mountpoint -q "$MOUNT"
+  fi
+}
 REMOTE="mikeb@oldbook:/mnt/PRIME"
 
 mkdir -p "$MOUNT"
 
-if mountpoint -q "$MOUNT"; then
+if is_mounted; then
   echo "cloud already mounted at $MOUNT"
   exit 0
 fi
 
 if ! command -v sshfs >/dev/null 2>&1; then
-  echo "SSHFS is missing. Install it with: omarchy pkg add sshfs" >&2
+  if [[ "$(uname -s)" == Darwin ]]; then
+    echo "SSHFS is missing. Install SSHFS and macFUSE." >&2
+  else
+    echo "SSHFS is missing. Install it with: omarchy pkg add sshfs" >&2
+  fi
   exit 1
 fi
 
@@ -31,7 +46,7 @@ for ((attempt=0; attempt<60; attempt++)); do
     cat "$LOG" >&2
     exit 1
   fi
-  if mountpoint -q "$MOUNT"; then
+  if is_mounted; then
     echo "mounted cloud at $MOUNT"
     exit 0
   fi

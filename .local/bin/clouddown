@@ -3,10 +3,25 @@ set -euo pipefail
 
 MOUNT="$HOME/mnt/cloud"
 
-if ! mountpoint -q "$MOUNT"; then
+is_mounted() {
+  if [[ "$(uname -s)" == Darwin ]]; then
+    /sbin/mount | awk -v target="$MOUNT" '
+      index($0, " on " target " (") { found = 1 }
+      END { exit !found }
+    '
+  else
+    mountpoint -q "$MOUNT"
+  fi
+}
+
+if ! is_mounted; then
   echo "cloud is already unmounted"
   exit 0
 fi
 
-fusermount3 -u "$MOUNT"
+if [[ "$(uname -s)" == Darwin ]]; then
+  /sbin/umount "$MOUNT"
+else
+  fusermount3 -u "$MOUNT"
+fi
 echo "unmounted cloud"
