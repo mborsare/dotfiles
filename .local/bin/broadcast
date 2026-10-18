@@ -63,6 +63,7 @@ import math
 import os
 from pathlib import Path
 import random
+import select
 import shutil
 import signal
 import subprocess
@@ -93,6 +94,10 @@ work = Path(tempfile.mkdtemp(prefix='prime-lite-'))
 stop = threading.Event()
 mode = ['movie']
 processes = []
+playlist = []
+playlist_index = 0
+resume_offset = 0.0
+transport_position = 0.0
 
 if w % 2 or h % 2 or w < 2 or h < 2 or fps < 1:
     raise SystemExit('DEFAULT_SIZE must have even positive dimensions; FPS >=1')
@@ -251,9 +256,11 @@ transport_video = ['-c:v','mpeg2video','-q:v','4','-g',str(2*fps),
 transport_audio = ['-c:a','mp2','-b:a','128k','-ar','48000','-ac','2']
 transport_output = ['-f','mpegts','-mpegts_flags','+resend_headers','pipe:1']
 
-def transport_movie(path):
+def transport_movie(path, offset=0):
     has_audio='audio' in probe(path,'stream=codec_type')
-    cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','error','-re','-i',str(path)]
+    cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','error']
+    if offset: cmd+=['-ss',str(offset)]
+    cmd+=['-re','-i',str(path)]
     if not has_audio:
         cmd+=['-re','-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
     vf=(f'fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease,'
@@ -297,25 +304,50 @@ def transport_rewind(duration, movie_duration):
          *transport_video,*transport_audio,*transport_output]
     return cmd
 
+def reap(proc):
+    if proc.poll() is None: proc.terminate()
+    try: proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
 def pump(cmd, encoder):
+    global transport_position
+    transport_position=0.0
     source=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=log_file,bufsize=0)
     processes.append(source)
     transferred=0
+    pending=b''
+    started=last_progress=time.monotonic()
+    os.set_blocking(source.stdout.fileno(),False)
+    os.set_blocking(encoder.stdin.fileno(),False)
     try:
         while not stop.is_set():
-            data=source.stdout.read(65536)
-            if not data: break
             if encoder.poll() is not None:
                 raise RuntimeError(f'HLS encoder exited: {encoder.returncode}')
-            encoder.stdin.write(data)
-            transferred+=len(data)
-        source.wait(timeout=5)
-        if source.returncode != 0 and not stop.is_set():
-            print(f'[Prime Lite] Source exited {source.returncode}',file=sys.stderr)
+            if time.monotonic()-last_progress > 60:
+                raise RuntimeError('Transport stalled for 60 seconds')
+            readable,writable,_=select.select(
+                [] if pending else [source.stdout],
+                [encoder.stdin] if pending else [],[],1)
+            if readable:
+                data=os.read(source.stdout.fileno(),65536)
+                if not data: break
+                pending=data
+            if writable:
+                try: count=os.write(encoder.stdin.fileno(),pending)
+                except BlockingIOError: continue
+                pending=pending[count:]
+                transferred+=count
+                last_progress=time.monotonic()
+                transport_position=max(0.0,last_progress-started-3.0)
+        if not stop.is_set():
+            source.wait(timeout=5)
+            if source.returncode != 0:
+                raise RuntimeError(f'Source exited {source.returncode}')
     finally:
         source.stdout.close()
-        if source.poll() is None: source.terminate()
-        source.wait()
+        reap(source)
         processes.remove(source)
     return transferred
 
@@ -327,11 +359,12 @@ def source_files():
     return files
 
 def movie(path, encoder):
+    global resume_offset
     mode[0]='movie'
     atomic(title_file,'On now:  '+(title_override or path.stem))
     atomic(rewind_label,'')
     atomic(rewind_stamp,'')
-    print(f'[Prime Lite] Playing: {path.name}',flush=True)
+    print(f'[Prime Lite] Playing: {path.name} at {resume_offset:.1f}s',flush=True)
     duration_str=probe(path,'format=duration')
     try: duration=float(duration_str)
     except ValueError: duration=0
@@ -341,7 +374,7 @@ def movie(path, encoder):
         def runtime_worker():
             started=time.monotonic()
             while not runtime_stop.is_set():
-                s=int(time.monotonic()-started)
+                s=int(resume_offset+time.monotonic()-started)
                 hours, rem=divmod(s,3600)
                 mins,secs=divmod(rem,60)
                 atomic(runtime_file,f'PLAY  {hours:02}:{mins:02}:{secs:02}')
@@ -349,7 +382,10 @@ def movie(path, encoder):
         runtime_thread=threading.Thread(target=runtime_worker,daemon=True)
         runtime_thread.start()
     try:
-        byte_count=pump(transport_movie(path),encoder)
+        byte_count=pump(transport_movie(path,resume_offset),encoder)
+    except Exception:
+        resume_offset+=transport_position
+        raise
     finally:
         runtime_stop.set()
         if runtime_thread is not None:
@@ -368,16 +404,17 @@ def rewind(path, duration, encoder):
     pump(transport_rewind(total,duration),encoder)
 
 def run():
+    global playlist, playlist_index, resume_offset
     root.mkdir(parents=True,exist_ok=True)
     if out.exists(): shutil.rmtree(out)
     out.mkdir(parents=True)
     (root/'channels.json').write_text(json.dumps([{'number':'03','name':'PRIME','path':'/Prime/index.m3u8'}])+'\n')
-    files=source_files()
+    if not playlist: playlist=source_files()
+    files=playlist
     if not files: raise RuntimeError('No playable media found')
     server=Server((bind,port),Handler)
     thread=threading.Thread(target=server.serve_forever,daemon=True)
     thread.start()
-    threading.Thread(target=quote_worker,daemon=True).start()
     graph=f'[0:v]fps={fps},setpts=N/({fps}*TB),format=yuv420p[base];'
     if logo.is_file():
         # Pipe input is source 0; image 1 is a static, endlessly looped overlay.
@@ -416,16 +453,21 @@ def run():
     print(f'[Prime Lite] Log: {log_path}',flush=True)
     try:
         while not stop.is_set():
-            for path in files:
-                if stop.is_set(): break
-                duration, amount=movie(path,encoder)
-                if not amount: print(f'[Prime Lite] No transport data: {path}',file=sys.stderr)
-                if len(files)==1 and amount:
-                    rewind(path,duration,encoder)
+            path=files[playlist_index]
+            duration,amount=movie(path,encoder)
+            resume_offset=0.0
+            playlist_index=(playlist_index+1)%len(files)
+            if not amount:
+                print(f'[Prime Lite] No transport data: {path}',file=sys.stderr)
+                stop.wait(2)
+            if len(files)==1 and amount:
+                rewind(path,duration,encoder)
     finally:
-        stop.set()
         server.shutdown()
+        server.server_close()
         encoder.stdin.close()
+        reap(encoder)
+        processes.remove(encoder)
 
 def shutdown(signum,frame):
     stop.set()
@@ -434,20 +476,39 @@ def shutdown(signum,frame):
 
 signal.signal(signal.SIGINT,shutdown)
 signal.signal(signal.SIGTERM,shutdown)
-log_file=log_path.open('w')
+log_file=log_path.open('a')
+def maintain_log():
+    while not stop.wait(30):
+        try:
+            if os.fstat(log_file.fileno()).st_size > 8*1024*1024:
+                with log_path.open('rb') as reader:
+                    reader.seek(-1024*1024,os.SEEK_END)
+                    tail=reader.read()
+                log_path.with_name(log_path.name+'.previous').write_bytes(tail)
+                os.ftruncate(log_file.fileno(),0)
+        except OSError as exc:
+            print(f'[Prime Lite] Log maintenance: {exc}',file=sys.stderr,flush=True)
+
+threading.Thread(target=quote_worker,daemon=True).start()
+threading.Thread(target=maintain_log,daemon=True).start()
 try:
-    run()
-except Exception as exc:
-    print(f'[Prime Lite] ERROR: {exc}',file=sys.stderr,flush=True)
-    try: print(log_path.read_text(errors='replace')[-4000:],file=sys.stderr)
-    except OSError: pass
-    raise SystemExit(1)
+    while not stop.is_set():
+        try:
+            run()
+        except Exception as exc:
+            if not stop.is_set():
+                message=f'[Prime Lite] {time.strftime("%Y-%m-%d %H:%M:%S")} ERROR: {exc}; retrying in 5 seconds'
+                print(message,file=sys.stderr,flush=True)
+                log_file.write(message+'\n')
+                log_file.flush()
+        finally:
+            for proc in list(processes):
+                reap(proc)
+                processes.remove(proc)
+        if not stop.is_set(): stop.wait(5)
 finally:
     stop.set()
-    for proc in list(processes):
-        if proc.poll() is None: proc.terminate()
-        try: proc.wait(timeout=3)
-        except subprocess.TimeoutExpired: proc.kill(); proc.wait()
+    for proc in list(processes): reap(proc)
     log_file.close()
     shutil.rmtree(work,ignore_errors=True)
 PY
