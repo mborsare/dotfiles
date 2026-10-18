@@ -70,6 +70,44 @@ if [[ -o interactive ]]; then
   prime_colors=(39 45 51 81 87 118 121 159 214 208 141)
   RANDOM_COL=${prime_colors[$(( 1 + RANDOM % $#prime_colors ))]}
 
+  # Paint a faint randomized grid, then draw the welcome over it.
+  () {
+    [[ -t 1 && "$TERM" != dumb ]] || return
+    local -a levels=(0 95 135 175 215 255)
+    local accent=$(( RANDOM_COL - 16 )) row col dots
+    printf '\033[38;2;%d;%d;%dm' \
+      "$(( levels[accent / 36 + 1] / 12 ))" \
+      "$(( levels[accent / 6 % 6 + 1] / 12 ))" \
+      "$(( levels[accent % 6 + 1] / 12 ))"
+    for (( row = 1; row <= LINES; row++ )); do
+      dots=''
+      for (( col = 1; col < COLUMNS; col++ )); do
+        if (( col % 2 && RANDOM % 5 != 0 )); then
+          dots+='·'
+        else
+          dots+=' '
+        fi
+      done
+      printf '\033[%d;1H%s' "$row" "$dots"
+    done
+    printf '\033[0m\033[H'
+  }
+
+  bio_msg="Build, risk, and be patient"
+  byline_color="\033[38;5;${RANDOM_COL}m"
+  reset="\033[0m"
+
+  for i in {0..6}; do
+    indent=$(printf '%*s' "$i" '')
+    printf "\r\033[K%s%b%s%b" "$indent" "$byline_color" "$bio_msg" "$reset"
+    sleep 0.015
+  done
+
+  sleep 0.1
+  printf "\r\033[K      %b%s%b" "$reset" "$bio_msg" "$reset"
+  sleep 0.1
+  printf "\r\033[K      %b%s%b\n" "$byline_color" "$bio_msg" "$reset"
+
   # Glitch the PRIME logo, then settle on the original artwork.
   () {
     local logo_text
@@ -89,7 +127,7 @@ EOF
 )
     logo_rows=("${(@f)logo_text}")
     glitch_chars=('░' '▒' '▓' '█' '/' '_' '+')
-    printf '\n\n'
+    printf '\n'
 
     # Redraw only when the terminal has enough room for the whole logo.
     if [[ -t 1 && "$TERM" != dumb ]] && (( COLUMNS >= 48 && LINES >= 16 )); then
@@ -110,53 +148,97 @@ EOF
             line[$col,$(( col + span - 1 ))]=$noise
             tint=${prime_colors[$(( 1 + RANDOM % $#prime_colors ))]}
           fi
-          printf '\r\033[2K\033[38;5;%sm%s\033[0m\n' "$tint" "$line"
+          printf '\r\033[38;5;%sm%s\033[0m\n' "$tint" "${(r:40:)line}"
         done
         sleep 0.04
         printf '\033[9A'
       done
     fi
 
-    for line in "${logo_rows[@]}"; do
-      printf '\r\033[2K\033[38;5;%sm%s\033[0m\n' "$RANDOM_COL" "$line"
+    for row in {1..9}; do
+      line=${logo_rows[$row]}
+      printf '\r\033[38;5;%sm%s\033[0m\n' "$RANDOM_COL" "${(r:40:)line}"
     done
-    printf '      Cyber, art, and risk\n\n'
   }
-
-  bio_msg="Access granted. Have a nice day"
-  yellow="\033[38;5;226m"
-  reset="\033[0m"
-
-  for i in {0..6}; do
-    indent=$(printf '%*s' "$i" '')
-    printf "\r\033[K%s%b%s%b" "$indent" "$yellow" "$bio_msg" "$reset"
-    sleep 0.015
-  done
-
-  sleep 0.1
-  printf "\r\033[K      %b%s%b" "$reset" "$bio_msg" "$reset"
-  sleep 0.1
-  printf "\r\033[K      %b%s%b\n" "$yellow" "$bio_msg" "$reset"
 
   weather_raw="$(curl -fsSL --max-time 2 'wttr.in/?format=%C+%t+%w' 2>/dev/null || true)"
 
-  printf "\n      \033[38;5;${RANDOM_COL}m%s\033[0m @ \033[38;5;245m%s\033[0m" \
-    "${weather_raw:-Weather unavailable}" \
-    "$(date '+%Y-%m-%d %H:%M:%S')"
+  _prime_session_weather=''
+  if [[ "$weather_raw" =~ '^(.+) ([+-]?[0-9]+)°F' ]]; then
+    session_condition=${(L)match[1]}
+    case "$session_condition" in
+      *thunder*) session_condition=stormy ;;
+      *snow*|*sleet*) session_condition=snowy ;;
+      *rain*|*drizzle*) session_condition=rainy ;;
+      *fog*|*mist*) session_condition=misty ;;
+      *overcast*) session_condition=overcast ;;
+      *cloud*) session_condition=cloudy ;;
+      *sun*) session_condition=sunny ;;
+      *clear*) session_condition=clear ;;
+      *) session_condition='' ;;
+    esac
+    session_temp=${match[2]}
+    # Strip a leading plus sign before shell arithmetic.
+    session_temp=${session_temp#+}
+    if (( session_temp < 40 )); then
+      session_feel=cold
+    elif (( session_temp < 60 )); then
+      session_feel=cool
+    elif (( session_temp < 75 )); then
+      session_feel=mild
+    elif (( session_temp < 85 )); then
+      session_feel=warm
+    else
+      session_feel=hot
+    fi
+    session_hour=$(date '+%H')
+    if (( session_hour < 5 || session_hour >= 21 )); then
+      session_period=night
+    elif (( session_hour < 12 )); then
+      session_period=morning
+    elif (( session_hour < 17 )); then
+      session_period=afternoon
+    else
+      session_period=evening
+    fi
+    _prime_session_weather=" on a $session_feel${session_condition:+, $session_condition} $session_period"
+  fi
 
-  printf "\n\n      \033[38;5;${RANDOM_COL}m%s\033[0m\n" "Hot files"
+  hot_heading='H O T   F I L E S'
+  printf '\n      \033[37m%s\033[0m  ' "$hot_heading"
+
+  hot_column=$(( 6 + ${#hot_heading} + 2 ))
+  hot_first_group=1
 
   for dir in "$HOME" "$HOME/bin" "$HOME/.local/bin" "$HOME/scripts" "$HOME/Sites/mikeb.work"; do
     [[ -d "$dir" ]] || continue
 
-    recent="$(find "$dir" -maxdepth 1 -type f -mtime -14 -print 2>/dev/null | sed "s#$HOME#~#" | sort | tail -5)"
+    recent="$(find "$dir" -maxdepth 1 -type f -mtime -14 -print 2>/dev/null | sort | tail -8)"
     [[ -n "$recent" ]] || continue
 
-    printf "\n      \033[38;5;${RANDOM_COL}m%s\033[0m\n" "${dir/#$HOME/~}"
-    printf "%s\n" "$recent" | sed 's/^/        /'
+    if (( ! hot_first_group )); then
+      printf '\n      '
+      hot_column=6
+    fi
+    hot_first_group=0
+    hot_group="${dir/#$HOME/~}"
+    if [[ "$dir" != "$HOME" ]]; then
+      printf '\033[37m%s\033[0m  ' "$hot_group"
+      (( hot_column += ${#hot_group} + 2 ))
+    fi
+    for hot_file in "${(@f)recent}"; do
+      hot_name=${hot_file:t}
+      hot_width=$(( ${#hot_name} + 2 ))
+      if (( hot_column + hot_width > COLUMNS )); then
+        printf '\n        '
+        hot_column=8
+      fi
+      (( hot_column += hot_width ))
+      printf '%s  ' "$hot_name"
+    done
   done
 
-  printf "\n\n\n"
+  printf "\n\n"
   printf "\033[0m"
 fi
 
@@ -256,6 +338,13 @@ zstyle ':vcs_info:git:*' actionformats ' %F{214} %b|%a%f'
 
 _prime_vcs_precmd() {
   vcs_info
+  if [[ -n "$_prime_first_prompt" ]]; then
+    print -P -- "%F{242}Session opened${_prime_session_weather//\%/%%} · %D{%b %d, %H:%M}%f"
+    _prime_prompt_stamp='%*'
+    unset _prime_first_prompt
+  else
+    _prime_prompt_stamp='%*'
+  fi
 }
 
 add-zsh-hook precmd _prime_vcs_precmd
@@ -275,4 +364,6 @@ battery_pct() {
 }
 
 # ── PRIME Prompt ─────────────────────────────────────────────────────────────
-PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~${vcs_info_msg_0_} %F{242}[%*]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
+_prime_first_prompt=1
+_prime_prompt_stamp='%*'
+PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~${vcs_info_msg_0_} %F{242}[${_prime_prompt_stamp}]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
