@@ -6,22 +6,23 @@ REMOTE="mikeb@oldbook:/mnt/PRIME"
 
 mkdir -p "$MOUNT"
 
-if mount | grep -q "on $MOUNT "; then
+if mountpoint -q "$MOUNT"; then
   echo "cloud already mounted at $MOUNT"
   exit 0
 fi
 
-# Keep SSHFS in foreground mode internally: macFUSE cannot fork after mounting.
-# The shell backgrounds it before macFUSE starts any threads.
-LOG_DIR="$HOME/Library/Logs"
+if ! command -v sshfs >/dev/null 2>&1; then
+  echo "SSHFS is missing. Install it with: omarchy pkg add sshfs" >&2
+  exit 1
+fi
+
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cloud"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/cloudup.log"
 nohup sshfs -f "$REMOTE" "$MOUNT" \
   -o reconnect \
   -o ServerAliveInterval=15 \
-  -o ServerAliveCountMax=3 \
-  -o defer_permissions \
-  -o volname=oldcloud >"$LOG" 2>&1 &
+  -o ServerAliveCountMax=3 >"$LOG" 2>&1 &
 SSHFS_PID=$!
 
 for ((attempt=0; attempt<60; attempt++)); do
@@ -30,7 +31,7 @@ for ((attempt=0; attempt<60; attempt++)); do
     cat "$LOG" >&2
     exit 1
   fi
-  if mount | grep -q "on $MOUNT "; then
+  if mountpoint -q "$MOUNT"; then
     echo "mounted cloud at $MOUNT"
     exit 0
   fi

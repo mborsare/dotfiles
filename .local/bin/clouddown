@@ -3,5 +3,10 @@ set -euo pipefail
 
 MOUNT="$HOME/mnt/cloud"
 
-umount "$MOUNT" 2>/dev/null || diskutil unmount "$MOUNT"
+if ! mountpoint -q "$MOUNT"; then
+  echo "cloud is already unmounted"
+  exit 0
+fi
+
+fusermount3 -u "$MOUNT"
 echo "unmounted cloud"

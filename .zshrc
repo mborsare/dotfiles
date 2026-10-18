@@ -286,7 +286,7 @@ alias scrap='${EDITOR:-nvim} -c "setlocal buftype=nofile bufhidden=wipe noswapfi
 alias stream='$HOME/stream.sh'
 unalias torrent 2>/dev/null
 function torrent {
-  command /opt/local/bin/aria2c "$@"
+  command aria2c "$@"
 }
 alias x='exit'
 
