@@ -98,6 +98,7 @@ playlist = []
 playlist_index = 0
 resume_offset = 0.0
 transport_position = 0.0
+broadcast_started = time.monotonic()
 
 if w % 2 or h % 2 or w < 2 or h < 2 or fps < 1:
     raise SystemExit('DEFAULT_SIZE must have even positive dimensions; FPS >=1')
@@ -195,6 +196,7 @@ class Server(http.server.ThreadingHTTPServer):
 quote_file=work/'quote.txt'
 title_file=work/'title.txt'
 runtime_file=work/'runtime.txt'
+uptime_file=work/'uptime.txt'
 rewind_label=work/'rewind-label.txt'
 rewind_stamp=work/'rewind-stamp.txt'
 rewind_frame_stamp=work/'rewind-frame-stamp.txt'
@@ -202,6 +204,14 @@ rewind_frame_label=work/'rewind-frame-label.txt'
 play_frame_label=work/'play-frame-label.txt'
 for file in (quote_file,title_file,runtime_file,rewind_label,rewind_stamp):
     atomic(file,'')
+atomic(uptime_file,'UP 00:00:00')
+
+def uptime_worker():
+    while not stop.is_set():
+        hours, remainder = divmod(int(time.monotonic()-broadcast_started), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        atomic(uptime_file, f'UP {hours:02}:{minutes:02}:{seconds:02}')
+        stop.wait(1)
 
 def fetch_nq_price():
     urls = [
@@ -423,7 +433,8 @@ def run():
     else:
         graph+='[base]null[decorated];'
         inputs=[]
-    layers=[draw(quote_file,12,'w-tw-24','h-th-56'),
+    layers=[draw(uptime_file,12,'24','20'),
+            draw(quote_file,12,'w-tw-24','h-th-56'),
             draw(title_file,11,'w-tw-24','h-th-37')]
     if show_runtime: layers.append(draw(runtime_file,12,'24','h-th-34'))
     layers.extend((draw(rewind_label,32,'(w-tw)/2','h/2-45',False),
@@ -490,6 +501,8 @@ def maintain_log():
             print(f'[Prime Lite] Log maintenance: {exc}',file=sys.stderr,flush=True)
 
 threading.Thread(target=quote_worker,daemon=True).start()
+uptime_thread=threading.Thread(target=uptime_worker,daemon=True)
+uptime_thread.start()
 threading.Thread(target=maintain_log,daemon=True).start()
 try:
     while not stop.is_set():
@@ -508,6 +521,7 @@ try:
         if not stop.is_set(): stop.wait(5)
 finally:
     stop.set()
+    uptime_thread.join()
     for proc in list(processes): reap(proc)
     log_file.close()
     shutil.rmtree(work,ignore_errors=True)
