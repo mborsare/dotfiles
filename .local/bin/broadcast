@@ -425,7 +425,9 @@ def run():
     server=Server((bind,port),Handler)
     thread=threading.Thread(target=server.serve_forever,daemon=True)
     thread.start()
-    graph=f'[0:v]fps={fps},setpts=N/({fps}*TB),format=yuv420p[base];'
+    # Keep the demuxer's shared A/V timeline across transport boundaries.
+    # Independent frame/sample counters accumulate gaps into permanent drift.
+    graph=f'[0:v]fps={fps},format=yuv420p[base];'
     if logo.is_file():
         # Pipe input is source 0; image 1 is a static, endlessly looped overlay.
         graph+='[1:v]scale=55:-1,format=rgba[logo];[base][logo]overlay=24:H-h-58:shortest=0[decorated];'
@@ -445,7 +447,7 @@ def run():
     cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','warning',
          '-fflags','+genpts+discardcorrupt','-f','mpegts','-i','pipe:0',*inputs,
          '-filter_complex',graph,'-map','[v]','-map','0:a:0',
-         '-af','asetpts=N/SR/TB',
+         '-af','aresample=48000:async=1000:first_pts=0',
          '-c:v','libx264','-preset','veryfast','-profile:v','main',
          '-b:v','1000k','-maxrate','1300k','-bufsize','2600k',
          '-g',str(fps*2),'-keyint_min',str(fps*2),'-sc_threshold','0',
