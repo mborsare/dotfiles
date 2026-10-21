@@ -59,6 +59,34 @@ if [[ -o interactive && -z "$TMUX" && "$TERM_PROGRAM" != "vscode" ]] &&
   fi
 fi
 
+# ── Per-Pane Background ──────────────────────────────────────────────────────
+# Tmux applies this to just this pane, including programs using default colors.
+# Re-sourcing .zshrc keeps the current tint; a new shell picks a fresh one.
+if [[ -o interactive && -n "$TMUX" && -n "$TMUX_PANE" ]]; then
+  () {
+    local -a backgrounds=(
+      '#00005f' '#001f3f' '#002b36' '#102820'
+      '#201535' '#301528' '#302015' '#182030'
+    )
+    if [[ "${_pane_background_id-}" != "$TMUX_PANE" ]]; then
+      _pane_background=${backgrounds[$(( 1 + RANDOM % $#backgrounds ))]}
+      _pane_background_id=$TMUX_PANE
+    fi
+    tmux select-pane -t "$TMUX_PANE" -P "bg=$_pane_background,fg=#eeeeee"
+    # Bright ANSI colors: every entry passes 4.5:1 on every background above.
+    local -a text_colors=(
+      '#aaaaaa' '#ff8787' '#87d787' '#ffd787'
+      '#87afff' '#d7afff' '#87d7d7' '#eeeeee'
+      '#aaaaaa' '#ff8787' '#87d787' '#ffd787'
+      '#87afff' '#d7afff' '#87d7d7' '#ffffff'
+    )
+    local index
+    for (( index = 1; index <= $#text_colors; index++ )); do
+      tmux set-option -p -t "$TMUX_PANE" "pane-colours[$(( index - 1 ))]" "${text_colors[index]}"
+    done
+  }
+fi
+
 # ── Login Banner ─────────────────────────────────────────────────────────────
 if [[ -o interactive ]]; then
   if [[ -x "$HOME/.config/alacritty/random-palette.zsh" ]]; then
@@ -247,6 +275,8 @@ fi
 [[ -s "$NVM_DIR/bash_completion" ]] && . "$NVM_DIR/bash_completion"
 
 # ── Aliases ──────────────────────────────────────────────────────────────────
+alias .ts='date "+%Y-%m-%d %H:%M:%S %Z"'
+alias .dd='date "+%A, %B %d, %Y"'
 alias at="$HOME/at.sh"
 alias c='clear'
 alias bins='cd "$HOME/.local/bin"'
@@ -339,7 +369,7 @@ zstyle ':vcs_info:git:*' actionformats ' %F{214} %b|%a%f'
 _prime_vcs_precmd() {
   vcs_info
   if [[ -n "$_prime_first_prompt" ]]; then
-    print -P -- "%F{242}Session opened${_prime_session_weather//\%/%%} · %D{%b %d, %H:%M}%f"
+    print -P -- "%F{248}Session opened${_prime_session_weather//\%/%%} · %D{%b %d, %H:%M}%f"
     _prime_prompt_stamp='%*'
     unset _prime_first_prompt
   else
@@ -351,6 +381,21 @@ add-zsh-hook precmd _prime_vcs_precmd
 
 compinit -u
 bindkey '^I' expand-or-complete
+
+# Expand date shortcuts into editable text when Space is pressed.
+_prime_expand_date() {
+  case "$LBUFFER" in
+    .ts|*[[:space:]].ts)
+      LBUFFER="${LBUFFER%.ts}$(date '+%Y-%m-%d %H:%M:%S %Z')"
+      ;;
+    .dd|*[[:space:]].dd)
+      LBUFFER="${LBUFFER%.dd}$(date '+%A, %B %d, %Y')"
+      ;;
+  esac
+  zle self-insert
+}
+zle -N _prime_expand_date
+bindkey ' ' _prime_expand_date
 
 # ── Prompt Helpers ───────────────────────────────────────────────────────────
 battery_pct() {
@@ -366,4 +411,4 @@ battery_pct() {
 # ── PRIME Prompt ─────────────────────────────────────────────────────────────
 _prime_first_prompt=1
 _prime_prompt_stamp='%*'
-PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~${vcs_info_msg_0_} %F{242}[${_prime_prompt_stamp}]%f %F{242}$(battery_pct)%f\n%F{242}%%%f '
+PROMPT=$'\n%F{$RANDOM_COL}%n@%m%f %F{189}%~${vcs_info_msg_0_} %F{248}[${_prime_prompt_stamp}]%f %F{248}$(battery_pct)%f\n%F{248}%%%f '
