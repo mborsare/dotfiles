@@ -33,7 +33,7 @@ while (( $# )); do
       echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--runtime] [--analog] [--tape-wear] [--now-playing TITLE]'
       echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
       echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking errors.'
-      echo '  --tape-wear  Start clean; wear each source picture into pixel rubble and static.'
+      echo '  --tape-wear  Start clean; build laserdisc-style speckles, dropouts, and snow.'
       echo '               Damage increases after every completed play.'
       echo '               Display only; files and audio are unchanged. Resets on restart.'
       exit 0 ;;
@@ -159,40 +159,37 @@ def analog_filter(strength=1.0):
             f"[tape_clean][tape_band]overlay=x=0:y='{y}':enable='lt({event},{0.035*strength:.4f})'")
 
 def tape_wear_filter(plays):
-    # Re-render from the untouched source. Wear belongs to a completed pass,
-    # so an encoder retry/resume never ages the tape. Approach heavy damage
-    # gradually without overflowing filter ranges during long broadcasts.
+    # Re-render from the untouched source. Only completed passes add wear;
+    # retries/resumes keep the same age. Keep picture detail at full resolution.
     if not plays:
         return ''
-    strength = 4 * (1 - math.exp(-plays / 8))
-    # Destroy spatial detail as well as color: fewer surviving pixels on each
-    # pass, enlarged with hard edges. By pass 32 every block is lost to snow.
-    # Native noise, lookup tables, and maskedmerge avoid interpreted per-pixel
-    # trigonometry. Keep all damage on a bounded grid, then enlarge once.
-    shrink = math.exp(-min(plays, 128) / 7)
-    pw = min(w, max(2, 2 * round(max(16, w * shrink) / 2)))
-    ph = min(h, max(2, 2 * round(max(10, h * shrink) / 2)))
-    grid_scale = min(1.0, 96 / pw, 54 / ph)
-    pw = max(2, 2 * int(pw * grid_scale / 2))
-    ph = max(2, 2 * int(ph * grid_scale / 2))
+    strength = 1 - math.exp(-plays / 8)
     loss = min(1.0, (plays / 32) ** 1.4)
     seed = random.randrange(1, 1000000)
-    # Uniform strength-100 noise on luma 128 spans [78,177]. A LUT turns
-    # that into a binary dropout mask with the requested loss probability.
+    # Laserdisc rot: frame-varying bright/dark flecks and colored pinpricks.
+    # Only the mask uses narrow horizontal cells (roughly 3x1 at 640x360).
+    # Never shrink the source or grow square blocks as the disc deteriorates.
+    speck_width = max(1, round(w / 3))
     threshold = 78 + 100 * loss
+    lut = f"'if(lt(val,{threshold:.6f}),255,0)'"
     return (
-        f'scale={pw}:{ph}:flags=area,format=yuv420p,'
-        f'eq=contrast={1+0.04*strength:.4f}:'
-        f'saturation={(1-0.18*strength)*(1-loss):.4f},'
+        'format=yuv444p,'
+        f'noise=c0s={round(10*strength)}:c0f=t+u:'
+        f'c1s={round(6*strength)}:c1f=t+u:'
+        f'c2s={round(6*strength)}:c2f=t+u,'
         'split=3[wear_picture][wear_mask_in][wear_snow_in];'
-        '[wear_mask_in]lutyuv=y=128,'
-        f'noise=c0s=100:c0f=t+u:c0_seed={seed},'
-        f"lutyuv=y='if(lt(val,{threshold:.6f}),255,0)'[wear_mask];"
-        '[wear_snow_in]lutyuv=y=128,'
-        f'noise=c0s=100:c0f=t+u:c0_seed={seed+1},'
+        f'[wear_mask_in]scale={speck_width}:{h}:flags=area,'
+        'lutyuv=y=128:u=128:v=128,'
+        # Equal seeds on full-resolution chroma keep all mask planes aligned.
+        f'noise=alls=100:allf=t+u:all_seed={seed},'
+        f'lutyuv=y={lut}:u={lut}:v={lut},'
+        f'scale={w}:{h}:flags=neighbor[wear_mask];'
+        '[wear_snow_in]lutyuv=y=128:u=128:v=128,'
+        f'noise=alls=100:allf=t+u:c0_seed={seed+1}:'
+        f'c1_seed={seed+2}:c2_seed={seed+3},'
         "lutyuv=y='clip(16+(val-78)*2.19,16,235)'[wear_snow];"
-        '[wear_picture][wear_snow][wear_mask]maskedmerge=planes=1,'
-        f'scale={w}:{h}:flags=neighbor,format=yuv420p')
+        '[wear_picture][wear_snow][wear_mask]maskedmerge=planes=7,'
+        'format=yuv420p')
 
 def probe(path, entry):
     result = subprocess.run([ffprobe, '-v','error','-show_entries',entry,
