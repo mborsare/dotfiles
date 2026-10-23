@@ -16,6 +16,7 @@ FFPROBE="${FFPROBE:-ffprobe}"
 COMIC_SHANNS_FONT="${COMIC_SHANNS_FONT:-}"
 SHOW_RUNTIME=0
 ANALOG=0
+TAPE_WEAR=0
 NOW_PLAYING_TITLE=""
 media_set=0
 
@@ -24,13 +25,16 @@ while (( $# )); do
   case "$1" in
     --runtime) SHOW_RUNTIME=1; shift ;;
     --analog) ANALOG=1; shift ;;
+    --tape-wear) TAPE_WEAR=1; shift ;;
     --now-playing)
       (( $# >= 2 )) || { echo '--now-playing needs a title' >&2; exit 2; }
       NOW_PLAYING_TITLE="$2"; shift 2 ;;
     --help|-h)
-      echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--runtime] [--analog] [--now-playing TITLE]'
+      echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--runtime] [--analog] [--tape-wear] [--now-playing TITLE]'
       echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
       echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking errors.'
+      echo '  --tape-wear  Start clean; wear each source picture after every completed play.'
+      echo '               Display only; files and audio are unchanged. Resets on restart.'
       exit 0 ;;
     --) shift; (( $# == 1 && ! media_set )) || exit 2; MEDIA_PATH="$1"; media_set=1; shift ;;
     -*) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -53,7 +57,7 @@ fi
 [[ -f "$COMIC_SHANNS_FONT" ]] || COMIC_SHANNS_FONT=''
 export PORT BIND_ADDR ROOT_HLS_DIR MEDIA_PATH LOGO_PATH DEFAULT_SIZE OUTPUT_FPS
 export QUOTE_BASE_URL REWIND_SECONDS FFMPEG FFPROBE COMIC_SHANNS_FONT
-export SHOW_RUNTIME NOW_PLAYING_TITLE ANALOG
+export SHOW_RUNTIME NOW_PLAYING_TITLE ANALOG TAPE_WEAR
 
 # Continuous Controller
 exec python3 - <<'PY'
@@ -87,6 +91,7 @@ font = os.environ['COMIC_SHANNS_FONT']
 title_override = os.environ['NOW_PLAYING_TITLE']
 show_runtime = os.environ['SHOW_RUNTIME'] == '1'
 analog = os.environ['ANALOG'] == '1'
+tape_wear = os.environ['TAPE_WEAR'] == '1'
 quote_url = os.environ['QUOTE_BASE_URL'].rstrip('/') + '/NQ'
 log_path = Path(os.environ.get('FFMPEG_LOG', '/tmp/prime-lite-ffmpeg.log'))
 out = root/'Prime'
@@ -99,6 +104,7 @@ playlist_index = 0
 resume_offset = 0.0
 transport_position = 0.0
 broadcast_started = time.monotonic()
+completed_plays = {}
 
 if w % 2 or h % 2 or w < 2 or h < 2 or fps < 1:
     raise SystemExit('DEFAULT_SIZE must have even positive dimensions; FPS >=1')
@@ -123,16 +129,16 @@ def draw(file, fontsize, x, y, box=True):
     b = ':box=1:boxcolor=black@0.55:boxborderw=3' if box else ''
     return f"drawtext={f}textfile='{esc(file)}':reload=1:x={x}:y={y}:fontsize={fontsize}:fontcolor=white{b}"
 
-def analog_filter():
-    # Apply after the overlays so the entire broadcast looks recorded to tape.
+def analog_filter(strength=1.0):
+    # --analog applies this after overlays; --tape-wear applies it to the source.
     # Keep dimensions, frame rate, and timestamps intact for continuous HLS.
     base = ','.join((
-        'gblur=sigma=0.45',
-        'gblur=sigma=1.1:planes=6',
-        'chromashift=cbh=2:crh=-2',
-        'eq=contrast=1.04:brightness=0.015:saturation=0.82',
-        'noise=alls=5:allf=t+u',
-        'drawgrid=width=iw:height=2:thickness=1:color=black@0.07'))
+        f'gblur=sigma={0.45*strength:.4f}',
+        f'gblur=sigma={1.1*strength:.4f}:planes=6',
+        f'chromashift=cbh={round(2*strength)}:crh={-round(2*strength)}',
+        f'eq=contrast={1+0.04*strength:.4f}:brightness={0.015*strength:.4f}:saturation={1-0.18*strength:.4f}',
+        f'noise=alls={5*strength:.4f}:allf=t+u',
+        f'drawgrid=width=iw:height=2:thickness=1:color=black@{0.07*strength:.4f}'))
     # Sparse, non-periodic tracking losses: a few damaged scanlines slip
     # sideways while the rest of the picture stays locked. Each event holds
     # for several frames; no continuous whole-frame oscillation.
@@ -142,14 +148,23 @@ def analog_filter():
     event = irregular('floor(t/0.23)', 0)
     position = irregular('floor(t/0.23)', 71)
     shift = irregular('floor(t/0.07)', 139)
-    band = max(2, min(h, 2 * round(h * 0.012)))
+    band = max(2, min(h, 2 * round(h * 0.012 * strength)))
     y = f'2*floor((H-{band})*(0.82+0.18*({position}))/2)'
     crop_y = y.replace('H', 'ih')
     return (base + ',split=2[tape_clean][tape_error];'
             f'[tape_error]crop=iw:{band}:0:\'{crop_y}\','
             f"pad=iw+32:ih:16:0:color=black,crop=iw-32:ih:x='16+12*(2*({shift})-1)':y=0,"
             'noise=alls=32:allf=t+u[tape_band];'
-            f"[tape_clean][tape_band]overlay=x=0:y='{y}':enable='lt({event},0.035)'")
+            f"[tape_clean][tape_band]overlay=x=0:y='{y}':enable='lt({event},{0.035*strength:.4f})'")
+
+def tape_wear_filter(plays):
+    # Re-render from the untouched source. Wear belongs to a completed pass,
+    # so an encoder retry/resume never ages the tape. Approach heavy damage
+    # gradually without overflowing filter ranges during long broadcasts.
+    if not plays:
+        return ''
+    strength = 4 * (1 - math.exp(-plays / 8))
+    return analog_filter(strength)
 
 def probe(path, entry):
     result = subprocess.run([ffprobe, '-v','error','-show_entries',entry,
@@ -275,6 +290,10 @@ def transport_movie(path, offset=0):
         cmd+=['-re','-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
     vf=(f'fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease,'
         f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p')
+    if tape_wear:
+        wear_filter = tape_wear_filter(completed_plays.get(path, 0))
+        if wear_filter:
+            vf += ',' + wear_filter
     cmd+=['-map','0:v:0','-map','0:a:0' if has_audio else '1:a:0',
           '-vf',vf,'-af','aresample=async=1:first_pts=0',
           *transport_video,*transport_audio]
@@ -375,6 +394,8 @@ def movie(path, encoder):
     atomic(rewind_label,'')
     atomic(rewind_stamp,'')
     print(f'[Prime Lite] Playing: {path.name} at {resume_offset:.1f}s',flush=True)
+    if tape_wear:
+        print(f'[Prime Lite] Tape wear: {completed_plays.get(path, 0)} completed plays',flush=True)
     duration_str=probe(path,'format=duration')
     try: duration=float(duration_str)
     except ValueError: duration=0
@@ -468,6 +489,8 @@ def run():
         while not stop.is_set():
             path=files[playlist_index]
             duration,amount=movie(path,encoder)
+            if amount:
+                completed_plays[path] = completed_plays.get(path, 0) + 1
             resume_offset=0.0
             playlist_index=(playlist_index+1)%len(files)
             if not amount:
