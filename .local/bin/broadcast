@@ -14,7 +14,7 @@ REWIND_SECONDS="${REWIND_SECONDS:-10}"
 FFMPEG="${FFMPEG:-ffmpeg}"
 FFPROBE="${FFPROBE:-ffprobe}"
 COMIC_SHANNS_FONT="${COMIC_SHANNS_FONT:-}"
-SHOW_RUNTIME=0
+SHOW_RUNTIME=1
 ANALOG=0
 TAPE_WEAR=0
 NOW_PLAYING_TITLE=""
@@ -33,7 +33,8 @@ while (( $# )); do
       echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--runtime] [--analog] [--tape-wear] [--now-playing TITLE]'
       echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
       echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking errors.'
-      echo '  --tape-wear  Start clean; wear each source picture after every completed play.'
+      echo '  --tape-wear  Start clean; wear each source picture into pixel rubble and static.'
+      echo '               Damage increases after every completed play.'
       echo '               Display only; files and audio are unchanged. Resets on restart.'
       exit 0 ;;
     --) shift; (( $# == 1 && ! media_set )) || exit 2; MEDIA_PATH="$1"; media_set=1; shift ;;
@@ -164,7 +165,24 @@ def tape_wear_filter(plays):
     if not plays:
         return ''
     strength = 4 * (1 - math.exp(-plays / 8))
-    return analog_filter(strength)
+    # Destroy spatial detail as well as color: fewer surviving pixels on each
+    # pass, enlarged with hard edges. By pass 32 every block is lost to snow.
+    # Work on the small grid so the per-pixel damage stays cheap at any size.
+    shrink = math.exp(-min(plays, 128) / 7)
+    pw = min(w, max(2, 2 * round(max(16, w * shrink) / 2)))
+    ph = min(h, max(2, 2 * round(max(10, h * shrink) / 2)))
+    loss = min(1.0, (plays / 32) ** 1.4)
+    seed = random.randrange(1, 1000000)
+    block = f'mod(abs(sin(X*12.9898+Y*78.233+floor(N/3)*37.719+{seed})*43758.5453),1)'
+    snow = f'mod(abs(sin(X*93.989+Y*67.345+N*11.135+{seed})*23421.631),1)'
+    missing = f'lt({block},{loss:.6f})'
+    pixels = (
+        f'scale={pw}:{ph}:flags=area,format=yuv444p,'
+        f"geq=lum='if({missing},16+219*({snow}),lum(X,Y))':"
+        f"cb='if({missing},128,cb(X,Y))':"
+        f"cr='if({missing},128,cr(X,Y))',"
+        f'scale={w}:{h}:flags=neighbor,format=yuv420p')
+    return analog_filter(strength) + ',' + pixels
 
 def probe(path, entry):
     result = subprocess.run([ffprobe, '-v','error','-show_entries',entry,
@@ -212,6 +230,7 @@ quote_file=work/'quote.txt'
 title_file=work/'title.txt'
 runtime_file=work/'runtime.txt'
 uptime_file=work/'uptime.txt'
+loop_file=work/'loop.txt'
 rewind_label=work/'rewind-label.txt'
 rewind_stamp=work/'rewind-stamp.txt'
 rewind_frame_stamp=work/'rewind-frame-stamp.txt'
@@ -220,6 +239,7 @@ play_frame_label=work/'play-frame-label.txt'
 for file in (quote_file,title_file,runtime_file,rewind_label,rewind_stamp):
     atomic(file,'')
 atomic(uptime_file,'UP 00:00:00')
+atomic(loop_file,'LOOP 0')
 
 def uptime_worker():
     while not stop.is_set():
@@ -390,6 +410,7 @@ def source_files():
 def movie(path, encoder):
     global resume_offset
     mode[0]='movie'
+    atomic(loop_file,f'LOOP {completed_plays.get(path, 0)}')
     atomic(title_file,'On now:  '+(title_override or path.stem))
     atomic(rewind_label,'')
     atomic(rewind_stamp,'')
@@ -457,6 +478,7 @@ def run():
         graph+='[base]null[decorated];'
         inputs=[]
     layers=[draw(uptime_file,12,'24','20'),
+            draw(loop_file,12,'w-tw-24','20'),
             draw(quote_file,12,'w-tw-24','h-th-56'),
             draw(title_file,11,'w-tw-24','h-th-37')]
     if show_runtime: layers.append(draw(runtime_file,12,'24','h-th-34'))
@@ -491,6 +513,7 @@ def run():
             duration,amount=movie(path,encoder)
             if amount:
                 completed_plays[path] = completed_plays.get(path, 0) + 1
+                atomic(loop_file,f'LOOP {completed_plays[path]}')
             resume_offset=0.0
             playlist_index=(playlist_index+1)%len(files)
             if not amount:
