@@ -33,7 +33,7 @@ while (( $# )); do
       echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--runtime] [--analog] [--tape-wear] [--now-playing TITLE]'
       echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
       echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking errors.'
-      echo '  --tape-wear  Start clean; build laserdisc-style speckles, dropouts, and snow.'
+      echo '  --tape-wear  Start clean; build snow, tracking tears, and wild color shifts.'
       echo '               Damage increases after every completed play.'
       echo '               Display only; files and audio are unchanged. Resets on restart.'
       exit 0 ;;
@@ -170,13 +170,27 @@ def tape_wear_filter(plays):
     # Only the mask uses narrow horizontal cells (roughly 3x1 at 640x360).
     # Never shrink the source or grow square blocks as the disc deteriorates.
     speck_width = max(1, round(w / 3))
-    threshold = 78 + 100 * loss
+    # Even at full wear, retain most of the source instead of replacing it
+    # with solid snow. Lost sync and runaway color provide the heavy damage.
+    threshold = 78 + 30 * loss
     lut = f"'if(lt(val,{threshold:.6f}),255,0)'"
+    band = max(2, min(h, 2 * round(h * (0.015 + 0.145 * loss) / 2)))
+    def irregular(clock, salt):
+        return f'mod(abs(sin(({clock}+{seed}+{salt})*12.9898)*43758.5453),1)'
+    position = irregular('floor(t/0.19)', 71)
+    shift = irregular('floor(t/0.09)', 139)
+    event = irregular('floor(t/0.19)', 0)
+    y = f'2*floor((H-{band})*({position})/2)'
+    crop_y = y.replace('H', 'ih')
+    color_shift = round(w * 0.045 * loss)
     return (
         'format=yuv444p,'
         f'noise=c0s={round(10*strength)}:c0f=t+u:'
         f'c1s={round(6*strength)}:c1f=t+u:'
         f'c2s={round(6*strength)}:c2f=t+u,'
+        # Shift chroma and hue aggressively, leaving luminance recognizable.
+        f'chromashift=cbh={color_shift}:crh={-color_shift}:edge=wrap,'
+        f"hue=h='{loss:.6f}*(125*sin(t*1.7)+55*sin(t*4.3))':s={1+0.8*loss:.6f},"
         'split=3[wear_picture][wear_mask_in][wear_snow_in];'
         f'[wear_mask_in]scale={speck_width}:{h}:flags=area,'
         'lutyuv=y=128:u=128:v=128,'
@@ -189,6 +203,12 @@ def tape_wear_filter(plays):
         f'c1_seed={seed+2}:c2_seed={seed+3},'
         "lutyuv=y='clip(16+(val-78)*2.19,16,235)'[wear_snow];"
         '[wear_picture][wear_snow][wear_mask]maskedmerge=planes=7,'
+        'split=2[wear_locked][wear_tear_in];'
+        f"[wear_tear_in]crop=iw:{band}:0:'{crop_y}',"
+        'split=2[wear_wrap_a][wear_wrap_b];'
+        '[wear_wrap_a][wear_wrap_b]hstack=inputs=2,'
+        f"crop=iw/2:ih:x='mod({w}+{w*0.20*loss:.6f}*(2*({shift})-1),{w})':y=0[wear_tear];"
+        f"[wear_locked][wear_tear]overlay=x=0:y='{y}':enable='lt({event},{0.85*loss:.6f})',"
         'format=yuv420p')
 
 def probe(path, entry):
