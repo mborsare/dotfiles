@@ -280,6 +280,7 @@ alias .dd='date "+%A, %B %d, %Y"'
 alias at="$HOME/at.sh"
 alias c='clear'
 alias bins='cd "$HOME/.local/bin"'
+alias d='dot'
 alias day="$HOME/day.sh"
 alias delete='rm -rv'
 alias docs='cd "$HOME/Documents"'

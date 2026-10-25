@@ -36,6 +36,7 @@ while (( $# )); do
       echo '  --tape-wear  Start clean; build snow, tracking tears, and wild color shifts.'
       echo '               Damage increases after every completed play.'
       echo '               Display only; files and audio are unchanged. Resets on restart.'
+      echo '  Both effects follow soundtrack hits with a short visual release.'
       exit 0 ;;
     --) shift; (( $# == 1 && ! media_set )) || exit 2; MEDIA_PATH="$1"; media_set=1; shift ;;
     -*) echo "Unknown argument: $1" >&2; exit 2 ;;
@@ -130,7 +131,7 @@ def draw(file, fontsize, x, y, box=True):
     b = ':box=1:boxcolor=black@0.55:boxborderw=3' if box else ''
     return f"drawtext={f}textfile='{esc(file)}':reload=1:x={x}:y={y}:fontsize={fontsize}:fontcolor=white{b}"
 
-def analog_filter(strength=1.0):
+def analog_filter(strength=1.0, reactive=False):
     # --analog applies this after overlays; --tape-wear applies it to the source.
     # Keep dimensions, frame rate, and timestamps intact for continuous HLS.
     base = ','.join((
@@ -156,7 +157,33 @@ def analog_filter(strength=1.0):
             f'[tape_error]crop=iw:{band}:0:\'{crop_y}\','
             f"pad=iw+32:ih:16:0:color=black,crop=iw-32:ih:x='16+12*(2*({shift})-1)':y=0,"
             'noise=alls=32:allf=t+u[tape_band];'
-            f"[tape_clean][tape_band]overlay=x=0:y='{y}':enable='lt({event},{0.035*strength:.4f})'")
+            f"[tape_clean][tape_band]overlay=x=0:y='{y}':enable='lt({event},{(0.65 if reactive else 0.035)*strength:.4f})'")
+
+def audio_linked_filter(video, audio, damage, tag):
+    # Follow the media timestamps inside FFmpeg, not the wall clock/HLS delay.
+    # Analyze a separate branch: the audible soundtrack is never processed here.
+    # Rectify channels separately so opposite-phase stereo cannot cancel hits.
+    # Peak follower: instant attack, 180 ms release at 8 kHz, independent of FPS.
+    release = math.exp(-1 / (8000 * 0.18))
+    envelope = (f"st(0,max(max(abs(val(0)),abs(val(1))),ld(0)*{release:.10f}));"
+                'ld(0)')
+    return (
+        f'[{video}]split=3[{tag}_clean][{tag}_in][{tag}_clock_in];'
+        f'[{tag}_clock_in]scale=1:1,format=yuv444p[{tag}_clock];'
+        f'[{tag}_in]{damage}[{tag}_damage];'
+        f'[{audio}]aresample=8000,aformat=channel_layouts=stereo,apad,'
+        f"aeval=exprs='{envelope}':c=mono,"
+        f'showvolume=r={fps}:w=80:h=1:b=0:f=0:c=0xffffffff:t=0:v=0:p=1,'
+        # Average the tiny meter into one value; no meter appears in the output.
+        'format=gray,scale=1:1:flags=area,'
+        "lut=y='255*(0.10+0.90*pow(clip((val-3)/100,0,1),0.8))',"
+        'format=yuv444p,geq=lum=lum(X\\,Y):cb=lum(X\\,Y):cr=lum(X\\,Y)'
+        f'[{tag}_level];'
+        # Bound the mask to the video timeline. Audio padding must not extend
+        # a movie or hold the final image during the rewind transition.
+        f'[{tag}_clock][{tag}_level]blend=all_expr=B:shortest=1,'
+        f'scale={w}:{h}:flags=neighbor,format=yuv420p[{tag}_mask];'
+        f'[{tag}_clean][{tag}_damage][{tag}_mask]maskedmerge=planes=7[{tag}_out]')
 
 def tape_wear_filter(plays):
     # Re-render from the untouched source. Only completed passes add wear;
@@ -337,12 +364,18 @@ def transport_movie(path, offset=0):
         cmd+=['-re','-f','lavfi','-i','anullsrc=r=48000:cl=stereo']
     vf=(f'fps={fps},scale={w}:{h}:force_original_aspect_ratio=decrease,'
         f'pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p')
+    wear_filter = ''
     if tape_wear:
         wear_filter = tape_wear_filter(completed_plays.get(path, 0))
-        if wear_filter:
-            vf += ',' + wear_filter
-    cmd+=['-map','0:v:0','-map','0:a:0' if has_audio else '1:a:0',
-          '-vf',vf,'-af','aresample=async=1:first_pts=0',
+    audio = '0:a:0' if has_audio else '1:a:0'
+    if wear_filter and has_audio:
+        graph = '[0:v:0]' + vf + '[wear_base];'
+        graph += audio_linked_filter('wear_base', audio, wear_filter, 'reactive_wear')
+        cmd += ['-filter_complex', graph, '-map', '[reactive_wear_out]']
+    else:
+        if wear_filter: vf += ',' + wear_filter
+        cmd += ['-vf', vf, '-map', '0:v:0']
+    cmd+=['-map',audio,'-af','aresample=async=1:first_pts=0',
           *transport_video,*transport_audio]
     if not has_audio: cmd+=['-shortest']
     return cmd+transport_output
@@ -512,8 +545,13 @@ def run():
     layers.extend((draw(rewind_label,32,'(w-tw)/2','h/2-45',False),
                    draw(rewind_stamp,24,'(w-tw)/2','h/2+8',False)))
     graph+='[decorated]'+','.join(layers)
-    if analog: graph+=','+analog_filter()
-    graph+='[v]'
+    if analog:
+        graph += '[analog_base];'
+        graph += audio_linked_filter('analog_base', '0:a:0',
+                                     analog_filter(reactive=True), 'reactive_analog')
+        graph += ';[reactive_analog_out]null[v]'
+    else:
+        graph+='[v]'
     cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','warning',
          '-fflags','+genpts+discardcorrupt','-f','mpegts','-i','pipe:0',*inputs,
          '-filter_complex',graph,'-map','[v]','-map','0:a:0',
