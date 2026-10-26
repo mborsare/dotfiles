@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REMOTE_HOST="${CHIMNEYSWEEPER_HOST:-primebook.prime}"
+REMOTE_HOST="${CHIMNEYSWEEPER_HOST:-primebook}"
 REMOTE_USER="${CHIMNEYSWEEPER_USER:-mikeb}"
 SSH_CONFIG="${CHIMNEYSWEEPER_SSH_CONFIG:-/dev/null}"
 REMOTE_DESKTOP="${CHIMNEYSWEEPER_DESKTOP:-Desktop}"
@@ -15,7 +15,7 @@ usage:
   chimneysweeper --dry-run
 
 env:
-  CHIMNEYSWEEPER_HOST       remote host to clean (default: primebook.prime)
+  CHIMNEYSWEEPER_HOST       remote host to clean (default: primebook)
   CHIMNEYSWEEPER_USER       remote user (default: mikeb)
   CHIMNEYSWEEPER_SSH_CONFIG ssh config for connecting to remote host (default: /dev/null)
   CHIMNEYSWEEPER_DESKTOP    remote desktop path under $HOME (default: Desktop)
