@@ -1,0 +1,27 @@
+*.default = true
+*.normal = true
+
+*.selected.reverse = toggle
+msglist_unread.bold = true
+msglist_deleted.dim = true
+msglist_flagged.fg = 3
+
+header.fg = 4
+header.bold = true
+border.fg = 8
+
+*error.fg = 1
+*warning.fg = 3
+*success.fg = 2
+
+[viewer]
+*.default = true
+*.normal = true
+url.fg = 4
+url.underline = true
+quote_1.fg = 6
+quote_2.fg = 5
+signature.dim = true
+
+[user]
+repeated.dim = true
