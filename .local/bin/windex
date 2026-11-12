@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE_HOST="${WINDEX_HOST:-${CHIMNEYSWEEPER_HOST:-primebook}}"
+REMOTE_USER="${WINDEX_USER:-${CHIMNEYSWEEPER_USER:-mikeb}}"
+SSH_CONFIG="${WINDEX_SSH_CONFIG:-${CHIMNEYSWEEPER_SSH_CONFIG:-/dev/null}}"
+REMOTE_DESKTOP="${WINDEX_DESKTOP:-${CHIMNEYSWEEPER_DESKTOP:-Desktop}}"
+DEST="${WINDEX_DEST:-${CHIMNEYSWEEPER_DEST:-$HOME/cloud/chimneysweeps}}"
+DRY_RUN=0
+
+usage() {
+  cat >&2 <<'EOF_USAGE'
+usage:
+  windex
+  windex --dry-run
+
+Moves sweeps into one flat directory. Screenshots become
+YYYY-MM-DD--HH-MM-SS.ext (24-hour time). Custom names are kept,
+with whitespace replaced by hyphens. Duplicate names get -2, -3, etc.
+Invisible/control characters and replacement symbols are stripped.
+Existing sweep subdirectories are flattened too.
+When the host and user match this machine, transfers run locally.
+
+env:
+  WINDEX_HOST       remote host to clean (default: primebook)
+  WINDEX_USER       remote user (default: mikeb)
+  WINDEX_SSH_CONFIG ssh config for connecting to remote host (default: /dev/null)
+  WINDEX_DESKTOP    remote desktop path under $HOME (default: Desktop)
+  WINDEX_DEST       local destination (default: $HOME/cloud/chimneysweeps)
+EOF_USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+resolve_path() {
+  # GNU readlink supports -m; macOS readlink does not.
+  if readlink -m "$1" 2>/dev/null; then
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+  else
+    printf '%s\n' 'Cannot resolve destination: install Python 3 or GNU readlink.' >&2
+    return 1
+  fi
+}
+
+dest_real="$(resolve_path "$DEST")"
+case "$dest_real" in
+  /mnt/cloud|/mnt/cloud/*)
+    expected_dev="$(readlink -f /dev/disk/by-label/cloud 2>/dev/null || true)"
+    mounted_source="$(findmnt -rn --mountpoint /mnt/cloud -o SOURCE 2>/dev/null || true)"
+    mounted_dev="$(readlink -f "$mounted_source" 2>/dev/null || printf '%s' "$mounted_source")"
+    if [[ -z "$expected_dev" || "$mounted_dev" != "$expected_dev" ]]; then
+      cat >&2 <<EOF_DEST
+Refusing to run: WINDEX_DEST resolves under /mnt/cloud,
+but /mnt/cloud is not mounted from /dev/disk/by-label/cloud.
+
+Destination: $DEST
+Resolved:    $dest_real
+Mounted:     ${mounted_source:-none}
+Expected:    ${expected_dev:-/dev/disk/by-label/cloud}
+
+Mount cloud at /mnt/cloud first, or set WINDEX_DEST to a
+different staging path if you intentionally want to write to local storage.
+EOF_DEST
+      exit 1
+    fi
+    ;;
+esac
+
+command -v python3 >/dev/null 2>&1 || {
+  printf '%s\n' 'windex requires Python 3.' >&2
+  exit 1
+}
+
+flatten_sweeps() {
+  python3 - "$DEST" "$DRY_RUN" <<'EOF_FLATTEN'
+import datetime
+import errno
+import os
+from pathlib import Path
+import re
+import sys
+import unicodedata
+
+root = Path(sys.argv[1]).absolute()
+dry_run = sys.argv[2] == '1'
+if not root.exists():
+    sys.exit(0)
+
+def filename(name):
+    # Normalize odd spaces and strip invisible formatting, invalid filename
+    # bytes, and replacement symbols before recognizing screenshot timestamps.
+    name = re.sub(r'\s+', ' ', name)
+    name = ''.join(character for character in name
+                   if not unicodedata.category(character).startswith('C')
+                   and character != '\ufffd')
+    # Recognize generated macOS and Linux screenshot names only.
+    match = re.fullmatch(
+        r'(?:Screenshot|Screen Shot|Screen shot)[ _-]+'
+        r'(\d{4}-\d{2}-\d{2})[ _-]+(?:at[ _-]+)?'
+        r'(\d{1,2})[.:-](\d{2})[.:-](\d{2})'
+        r'(?:[\s_\-\u202f\u00a0]*(AM|PM))?'
+        r'(\.(?:png|jpe?g|heic|tiff?|webp))', name, re.IGNORECASE)
+    if match:
+        date, hour, minute, second, period, extension = match.groups()
+        try:
+            hour = int(hour)
+            if period:
+                if not 1 <= hour <= 12:
+                    raise ValueError('invalid 12-hour time')
+                hour = hour % 12 + (12 if period.upper() == 'PM' else 0)
+            stamp = datetime.datetime.fromisoformat(
+                f'{date}T{hour:02}:{minute}:{second}')
+            return stamp.strftime('%Y-%m-%d--%H-%M-%S') + extension
+        except ValueError:
+            pass
+    cleaned = name.replace(' ', '-')
+    return cleaned if cleaned not in ('', '.', '..') else 'file'
+
+files = []
+directories = []
+for directory, dirs, names in os.walk(root, followlinks=False):
+    parent = Path(directory)
+    # rsync keeps interrupted transfers here; never publish incomplete files.
+    dirs[:] = [name for name in dirs if name != '.rsync-partial']
+    for name in list(dirs):
+        path = parent / name
+        if path.is_symlink():
+            names.append(name)
+            dirs.remove(name)
+    directories.append(parent)
+    files.extend(parent / name for name in names)
+
+# Preserve files already in the top directory before allocating other names.
+files.sort(key=lambda p: (p.parent != root, str(p)))
+reserved = {p.name for p in root.iterdir()}
+for source in files:
+    name = filename(source.name)
+    target = root / name
+    if source == target:
+        continue
+    stem, extension = os.path.splitext(name)
+    number = 2
+    while True:
+        while target.name in reserved or os.path.lexists(target):
+            target = root / f'{stem}-{number}{extension}'
+            number += 1
+        if dry_run:
+            break
+        try:
+            # Publish without overwriting; leave source intact on failure.
+            if source.is_symlink():
+                os.symlink(os.readlink(source), target)
+            else:
+                os.link(source, target)
+            source.unlink()
+            break
+        except FileExistsError:
+            reserved.add(target.name)
+    reserved.add(target.name)
+    print(f'{"Would move" if dry_run else "Moved"}: '
+          f'{str(source.relative_to(root))!r} -> {target.name!r}')
+
+if not dry_run:
+    for directory in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+        if directory != root:
+            try:
+                directory.rmdir()
+            except OSError as error:
+                if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+                    raise
+EOF_FLATTEN
+}
+
+local_source=0
+local_host="$(hostname)"
+short_host="$(hostname -s)"
+if [[ "$REMOTE_USER" == "$(id -un)" ]]; then
+  case "$REMOTE_HOST" in
+    "$local_host"|"$short_host"|"$short_host.local"|localhost|127.0.0.1|::1)
+      local_source=1
+      ;;
+  esac
+fi
+
+if [[ "$local_source" -eq 1 ]]; then
+  case "$REMOTE_DESKTOP" in
+    /*) local_desktop="$REMOTE_DESKTOP" ;;
+    *) local_desktop="$HOME/$REMOTE_DESKTOP" ;;
+  esac
+  # Overlapping source/destination directories could sweep the output again.
+  python3 - "$local_desktop" "$DEST" <<'EOF_LOCAL_CHECK'
+import os
+import sys
+source, destination = map(os.path.realpath, sys.argv[1:])
+if os.path.commonpath([source, destination]) in (source, destination):
+    sys.exit('Refusing to sweep overlapping source and destination directories.')
+EOF_LOCAL_CHECK
+  transfer_source="${local_desktop%/}/"
+else
+  transfer_source="$REMOTE_USER@$REMOTE_HOST:${REMOTE_DESKTOP%/}/"
+fi
+
+flatten_sweeps
+
+incoming="$DEST/.chimneysweeper-incoming"
+if [[ -L "$incoming" ]]; then
+  printf '%s\n' 'Refusing to use a symlink as the incoming directory.' >&2
+  exit 1
+fi
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  mkdir -p "$incoming"
+fi
+
+rsync_args=(
+  -avh
+  --8-bit-output
+  --ignore-existing
+  --partial
+  --partial-dir=.rsync-partial
+  --remove-source-files
+  --exclude=.DS_Store
+  --exclude=.localized
+  --exclude=desktop.ini
+  -e "ssh -F $SSH_CONFIG"
+)
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  rsync_args+=(-n --itemize-changes)
+fi
+
+transfer_status=0
+rsync "${rsync_args[@]}" "$transfer_source" "$incoming/" || transfer_status=$?
+
+# Finish organizing successfully received files even if another transfer failed.
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  flatten_sweeps
+fi
+if [[ "$transfer_status" -ne 0 ]]; then
+  exit "$transfer_status"
+fi
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+  if [[ "$local_source" -eq 1 ]]; then
+    find "$local_desktop" -depth -mindepth 1 -type d -empty -delete
+    exit 0
+  fi
+  ssh -F "$SSH_CONFIG" "$REMOTE_USER@$REMOTE_HOST" \
+    "WINDEX_DESKTOP=$(printf '%q' "$REMOTE_DESKTOP") bash -s" <<'EOF_REMOTE'
+set -euo pipefail
+
+desktop="$HOME/${WINDEX_DESKTOP#/}"
+find "$desktop" -mindepth 1 -type d -empty -delete
+EOF_REMOTE
+fi

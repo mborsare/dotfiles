@@ -13,14 +13,7 @@ is_mounted() {
     mountpoint -q "$MOUNT"
   fi
 }
-REMOTE="mikeb@oldbook:/mnt/PRIME"
-
 mkdir -p "$MOUNT"
-
-if is_mounted; then
-  echo "cloud already mounted at $MOUNT"
-  exit 0
-fi
 
 if ! command -v sshfs >/dev/null 2>&1; then
   if [[ "$(uname -s)" == Darwin ]]; then
@@ -31,21 +24,16 @@ if ! command -v sshfs >/dev/null 2>&1; then
   exit 1
 fi
 
+"$HOME/.local/libexec/cloud-service" start
+
+if is_mounted; then
+  echo "cloud already mounted at $MOUNT"
+  exit 0
+fi
+
 LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cloud"
 mkdir -p "$LOG_DIR"
-LOG="$LOG_DIR/cloudup.log"
-nohup sshfs -f "$REMOTE" "$MOUNT" \
-  -o reconnect \
-  -o ServerAliveInterval=15 \
-  -o ServerAliveCountMax=3 >"$LOG" 2>&1 &
-SSHFS_PID=$!
-
 for ((attempt=0; attempt<60; attempt++)); do
-  if ! kill -0 "$SSHFS_PID" 2>/dev/null; then
-    echo "cloud mount failed; SSHFS output:" >&2
-    cat "$LOG" >&2
-    exit 1
-  fi
   if is_mounted; then
     echo "mounted cloud at $MOUNT"
     exit 0
@@ -53,5 +41,10 @@ for ((attempt=0; attempt<60; attempt++)); do
   sleep 0.5
 done
 
-echo "cloud mount is still pending; see $LOG" >&2
+echo "cloud mount is pending; the background service will keep retrying" >&2
+if [[ "$(uname -s)" == Darwin ]]; then
+  echo "See $LOG_DIR/service.log" >&2
+else
+  echo "See: journalctl --user -u cloudup.service" >&2
+fi
 exit 1

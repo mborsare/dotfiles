@@ -3,6 +3,8 @@ set -euo pipefail
 
 MOUNT="$HOME/mnt/cloud"
 
+"$HOME/.local/libexec/cloud-service" stop
+
 is_mounted() {
   if [[ "$(uname -s)" == Darwin ]]; then
     /sbin/mount | awk -v target="$MOUNT" '
@@ -22,6 +24,10 @@ fi
 if [[ "$(uname -s)" == Darwin ]]; then
   /sbin/umount "$MOUNT"
 else
-  fusermount3 -u "$MOUNT"
+  if command -v fusermount3 >/dev/null 2>&1; then
+    fusermount3 -u "$MOUNT"
+  else
+    fusermount -u "$MOUNT"
+  fi
 fi
 echo "unmounted cloud"
