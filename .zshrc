@@ -285,6 +285,7 @@ alias day="$HOME/day.sh"
 alias delete='rm -rv'
 alias docs='cd "$HOME/Documents"'
 alias dot='git --git-dir="$HOME/.local/share/dotfiles.git" --work-tree="$HOME"'
+alias da='dot add'
 alias ds='dot status -uno'
 alias drives='lsblk -f'
 alias edit='nvim'
