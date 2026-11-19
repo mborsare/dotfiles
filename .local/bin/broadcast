@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Configuration
-PORT="${PORT:-8090}"
+PORT="${PORT:-}"
+STREAM_SLUG="${STREAM_SLUG:-Prime}"
 BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
 ROOT_HLS_DIR="${ROOT_HLS_DIR:-$HOME/cloud/broadcast-hls}"
 MEDIA_PATH="${DEFAULT_MEDIA_DIR:-$HOME/Documents/Will-broadcast}"
@@ -23,6 +24,12 @@ media_set=0
 # Arguments
 while (( $# )); do
   case "$1" in
+    --slug)
+      (( $# >= 2 )) || { echo '--slug needs a name' >&2; exit 2; }
+      STREAM_SLUG="$2"; shift 2 ;;
+    --port)
+      (( $# >= 2 )) || { echo '--port needs a number' >&2; exit 2; }
+      PORT="$2"; shift 2 ;;
     --runtime) SHOW_RUNTIME=1; shift ;;
     --analog) ANALOG=1; shift ;;
     --tape-wear) TAPE_WEAR=1; shift ;;
@@ -30,7 +37,9 @@ while (( $# )); do
       (( $# >= 2 )) || { echo '--now-playing needs a title' >&2; exit 2; }
       NOW_PLAYING_TITLE="$2"; shift 2 ;;
     --help|-h)
-      echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--runtime] [--analog] [--tape-wear] [--now-playing TITLE]'
+      echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--slug NAME] [--port PORT] [--runtime] [--analog] [--tape-wear] [--now-playing TITLE]'
+      echo '  --slug NAME  Stream path (default: Prime; beepbeep uses port 8091).'
+      echo '  --port PORT  Override HTTP port (default: 8090 for other slugs).'
       echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
       echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking errors.'
       echo '  --tape-wear  Start clean; build snow, tracking tears, and wild color shifts.'
@@ -44,6 +53,11 @@ while (( $# )); do
        MEDIA_PATH="$1"; media_set=1; shift ;;
   esac
 done
+[[ "$STREAM_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo 'Invalid stream slug' >&2; exit 2; }
+if [[ -z "$PORT" ]]; then
+  if [[ "$STREAM_SLUG" == beepbeep ]]; then PORT=8091; else PORT=8090; fi
+fi
+[[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || { echo 'Invalid port' >&2; exit 2; }
 [[ -e "$MEDIA_PATH" ]] || { echo "Missing media: $MEDIA_PATH" >&2; exit 1; }
 for binary in "$FFMPEG" "$FFPROBE" python3; do
   command -v "$binary" >/dev/null || { echo "Missing $binary" >&2; exit 1; }
@@ -57,12 +71,13 @@ if [[ ! -f "$COMIC_SHANNS_FONT" ]]; then
   COMIC_SHANNS_FONT='/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf'
 fi
 [[ -f "$COMIC_SHANNS_FONT" ]] || COMIC_SHANNS_FONT=''
-export PORT BIND_ADDR ROOT_HLS_DIR MEDIA_PATH LOGO_PATH DEFAULT_SIZE OUTPUT_FPS
+export STREAM_SLUG PORT BIND_ADDR ROOT_HLS_DIR MEDIA_PATH LOGO_PATH DEFAULT_SIZE OUTPUT_FPS
 export QUOTE_BASE_URL REWIND_SECONDS FFMPEG FFPROBE COMIC_SHANNS_FONT
 export SHOW_RUNTIME NOW_PLAYING_TITLE ANALOG TAPE_WEAR
 
 # Continuous Controller
 exec python3 - <<'PY'
+import fcntl
 import http.server
 import json
 import math
@@ -79,6 +94,7 @@ import threading
 import time
 import urllib.request
 
+slug = os.environ['STREAM_SLUG']
 port = int(os.environ['PORT'])
 bind = os.environ['BIND_ADDR']
 root = Path(os.environ['ROOT_HLS_DIR']).expanduser()
@@ -95,8 +111,9 @@ show_runtime = os.environ['SHOW_RUNTIME'] == '1'
 analog = os.environ['ANALOG'] == '1'
 tape_wear = os.environ['TAPE_WEAR'] == '1'
 quote_url = os.environ['QUOTE_BASE_URL'].rstrip('/') + '/NQ'
-log_path = Path(os.environ.get('FFMPEG_LOG', '/tmp/prime-lite-ffmpeg.log'))
-out = root/'Prime'
+default_log = '/tmp/prime-lite-ffmpeg.log' if slug == 'Prime' else f'/tmp/broadcast-{slug}-ffmpeg.log'
+log_path = Path(os.environ.get('FFMPEG_LOG', default_log))
+out = root/slug
 work = Path(tempfile.mkdtemp(prefix='prime-lite-'))
 stop = threading.Event()
 mode = ['movie']
@@ -522,13 +539,23 @@ def rewind(path, duration, encoder):
 def run():
     global playlist, playlist_index, resume_offset
     root.mkdir(parents=True,exist_ok=True)
+    # Bind before touching stream output: port conflicts must not erase a feed.
+    server=Server((bind,port),Handler)
+    if out.is_symlink():
+        server.server_close()
+        raise RuntimeError('Stream output must not be a symlink')
     if out.exists(): shutil.rmtree(out)
     out.mkdir(parents=True)
-    (root/'channels.json').write_text(json.dumps([{'number':'03','name':'PRIME','path':'/Prime/index.m3u8'}])+'\n')
+    channel = {'number': '03' if slug == 'Prime' else '04', 'name': 'PRIME' if slug == 'Prime' else slug.upper(), 'path': f'/{slug}/index.m3u8'}
+    atomic(out/'channel.json', json.dumps(channel))
+    # Alternate channels never replace the legacy broadcaster's shared index.
+    if slug == 'Prime':
+        atomic(root/'channels.json', json.dumps([channel]))
     if not playlist: playlist=source_files()
     files=playlist
-    if not files: raise RuntimeError('No playable media found')
-    server=Server((bind,port),Handler)
+    if not files:
+        server.server_close()
+        raise RuntimeError('No playable media found')
     thread=threading.Thread(target=server.serve_forever,daemon=True)
     thread.start()
     # Keep the demuxer's shared A/V timeline across transport boundaries.
@@ -573,7 +600,7 @@ def run():
          str(out/'index.m3u8')]
     encoder=subprocess.Popen(cmd,stdin=subprocess.PIPE,stderr=log_file,bufsize=0)
     processes.append(encoder)
-    print(f'[Prime Lite] http://{bind}:{port}/Prime/index.m3u8',flush=True)
+    print(f'[Prime Lite] http://{bind}:{port}/{slug}/index.m3u8',flush=True)
     print(f'[Prime Lite] Font: {font or "FFmpeg default"}',flush=True)
     print(f'[Prime Lite] Continuous HLS encoder: PID {encoder.pid}',flush=True)
     print(f'[Prime Lite] Log: {log_path}',flush=True)
@@ -605,6 +632,13 @@ def shutdown(signum,frame):
 
 signal.signal(signal.SIGINT,shutdown)
 signal.signal(signal.SIGTERM,shutdown)
+# Hold a per-channel lock for this process, including encoder retries.
+root.mkdir(parents=True, exist_ok=True)
+channel_lock=(root/f'.broadcast-{slug}.lock').open('a')
+try:
+    fcntl.flock(channel_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(f'Broadcast already running for slug: {slug}')
 log_file=log_path.open('a')
 def maintain_log():
     while not stop.wait(30):
