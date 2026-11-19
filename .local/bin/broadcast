@@ -39,7 +39,8 @@ while (( $# )); do
     --help|-h)
       echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--slug NAME] [--port PORT] [--runtime] [--analog] [--tape-wear] [--now-playing TITLE]'
       echo '  --slug NAME  Stream path (default: Prime; beepbeep uses port 8091).'
-      echo '  --port PORT  Override HTTP port (default: 8090 for other slugs).'
+      echo '  Default ports: Prime 8090, beepbeep 8091, then 8092 upward per new slug.'
+      echo '  --port PORT  Override the automatic HTTP port.'
       echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
       echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking errors.'
       echo '  --tape-wear  Start clean; build snow, tracking tears, and wild color shifts.'
@@ -54,10 +55,9 @@ while (( $# )); do
   esac
 done
 [[ "$STREAM_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo 'Invalid stream slug' >&2; exit 2; }
-if [[ -z "$PORT" ]]; then
-  if [[ "$STREAM_SLUG" == beepbeep ]]; then PORT=8091; else PORT=8090; fi
+if [[ -n "$PORT" ]]; then
+  [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || { echo 'Invalid port' >&2; exit 2; }
 fi
-[[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || { echo 'Invalid port' >&2; exit 2; }
 [[ -e "$MEDIA_PATH" ]] || { echo "Missing media: $MEDIA_PATH" >&2; exit 1; }
 for binary in "$FFMPEG" "$FFPROBE" python3; do
   command -v "$binary" >/dev/null || { echo "Missing $binary" >&2; exit 1; }
@@ -95,7 +95,7 @@ import time
 import urllib.request
 
 slug = os.environ['STREAM_SLUG']
-port = int(os.environ['PORT'])
+port = int(os.environ['PORT']) if os.environ['PORT'] else None
 bind = os.environ['BIND_ADDR']
 root = Path(os.environ['ROOT_HLS_DIR']).expanduser()
 media = Path(os.environ['MEDIA_PATH']).expanduser()
@@ -139,6 +139,33 @@ def atomic(path, value):
         os.replace(new, path)
     finally:
         new.unlink(missing_ok=True)
+
+def resolve_port(root, slug, requested=None):
+    if requested is not None:
+        return requested
+    # Preserve the exact legacy Prime endpoint used by Cloudflare.
+    fixed = {'Prime': 8090, 'beepbeep': 8091}
+    if slug in fixed:
+        return fixed[slug]
+    root.mkdir(parents=True, exist_ok=True)
+    # Separate lock inode: the JSON file is replaced atomically on each write.
+    with (root/'.broadcast-ports.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        registry = root/'.broadcast-ports.json'
+        assigned = json.loads(registry.read_text()) if registry.exists() else {}
+        if (not isinstance(assigned, dict)
+                or any(name in fixed or not isinstance(value, int)
+                       or not 8092 <= value <= 65535
+                       for name, value in assigned.items())
+                or len(set(assigned.values())) != len(assigned)):
+            raise ValueError(f'Invalid channel port registry: {registry}')
+        if slug not in assigned:
+            next_port = max([8091, *assigned.values()]) + 1
+            if next_port > 65535:
+                raise RuntimeError('No channel ports remaining')
+            assigned[slug] = next_port
+            atomic(registry, json.dumps(assigned, sort_keys=True))
+        return assigned[slug]
 
 def esc(value):
     return str(value).replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'").replace(',', '\\,')
@@ -639,6 +666,7 @@ try:
     fcntl.flock(channel_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
     raise SystemExit(f'Broadcast already running for slug: {slug}')
+port = resolve_port(root, slug, port)
 log_file=log_path.open('a')
 def maintain_log():
     while not stop.wait(30):
