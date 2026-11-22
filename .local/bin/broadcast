@@ -8,8 +8,15 @@ BIND_ADDR="${BIND_ADDR:-127.0.0.1}"
 ROOT_HLS_DIR="${ROOT_HLS_DIR:-$HOME/cloud/broadcast-hls}"
 MEDIA_PATH="${DEFAULT_MEDIA_DIR:-$HOME/Documents/Will-broadcast}"
 LOGO_PATH="${LOGO_PATH:-$HOME/.local/share/broadcast/mike-logo.png}"
-DEFAULT_SIZE="${DEFAULT_SIZE:-960:540}"
-OUTPUT_FPS="${OUTPUT_FPS:-30}"
+DEFAULT_SIZE="${DEFAULT_SIZE:-1280:720}"
+# Movies and most animation are 24 fps. Override with OUTPUT_FPS=30 if needed.
+OUTPUT_FPS="${OUTPUT_FPS:-24}"
+# Encoder quality/speed knob: superfast is a substantial CPU reduction vs veryfast.
+# ultrafast is available if the host still cannot maintain real time.
+VIDEO_PRESET="${VIDEO_PRESET:-superfast}"
+VIDEO_BITRATE="${VIDEO_BITRATE:-2000k}"
+VIDEO_MAXRATE="${VIDEO_MAXRATE:-2600k}"
+VIDEO_BUFSIZE="${VIDEO_BUFSIZE:-5200k}"
 QUOTE_BASE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
 REWIND_SECONDS="${REWIND_SECONDS:-10}"
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -41,6 +48,8 @@ while (( $# )); do
       echo '  --slug NAME  Stream path (default: Prime; beepbeep uses port 8091).'
       echo '  Default ports: Prime 8090, beepbeep 8091, then 8092 upward per new slug.'
       echo '  --port PORT  Override the automatic HTTP port.'
+      echo '  Default: 1280x720 @ 24fps, libx264 superfast, capped 2.6 Mbps video.'
+      echo '  Tune with OUTPUT_FPS=30 or VIDEO_PRESET=ultrafast if necessary.'
       echo 'One persistent HLS encoder. Movies and rewind feed a single MPEG-TS pipe.'
       echo '  --analog  Add VHS softness, color bleed, grain, scanlines, and tracking errors.'
       echo '  --tape-wear  Start clean; build snow, tracking tears, and wild color shifts.'
@@ -72,6 +81,7 @@ if [[ ! -f "$COMIC_SHANNS_FONT" ]]; then
 fi
 [[ -f "$COMIC_SHANNS_FONT" ]] || COMIC_SHANNS_FONT=''
 export STREAM_SLUG PORT BIND_ADDR ROOT_HLS_DIR MEDIA_PATH LOGO_PATH DEFAULT_SIZE OUTPUT_FPS
+export VIDEO_PRESET VIDEO_BITRATE VIDEO_MAXRATE VIDEO_BUFSIZE
 export QUOTE_BASE_URL REWIND_SECONDS FFMPEG FFPROBE COMIC_SHANNS_FONT
 export SHOW_RUNTIME NOW_PLAYING_TITLE ANALOG TAPE_WEAR
 
@@ -102,6 +112,10 @@ media = Path(os.environ['MEDIA_PATH']).expanduser()
 logo = Path(os.environ['LOGO_PATH']).expanduser()
 w, h = [int(x) for x in os.environ['DEFAULT_SIZE'].split(':')]
 fps = int(os.environ['OUTPUT_FPS'])
+video_preset = os.environ['VIDEO_PRESET']
+video_bitrate = os.environ['VIDEO_BITRATE']
+video_maxrate = os.environ['VIDEO_MAXRATE']
+video_bufsize = os.environ['VIDEO_BUFSIZE']
 rewind_secs = max(0.1, float(os.environ['REWIND_SECONDS']))
 ffmpeg = os.environ['FFMPEG']
 ffprobe = os.environ['FFPROBE']
@@ -113,6 +127,7 @@ tape_wear = os.environ['TAPE_WEAR'] == '1'
 quote_url = os.environ['QUOTE_BASE_URL'].rstrip('/') + '/NQ'
 default_log = '/tmp/prime-lite-ffmpeg.log' if slug == 'Prime' else f'/tmp/broadcast-{slug}-ffmpeg.log'
 log_path = Path(os.environ.get('FFMPEG_LOG', default_log))
+progress_path = Path(os.environ.get('FFMPEG_PROGRESS', f'/tmp/broadcast-{slug}-progress.log'))
 out = root/slug
 work = Path(tempfile.mkdtemp(prefix='prime-lite-'))
 stop = threading.Event()
@@ -127,6 +142,8 @@ completed_plays = {}
 
 if w % 2 or h % 2 or w < 2 or h < 2 or fps < 1:
     raise SystemExit('DEFAULT_SIZE must have even positive dimensions; FPS >=1')
+if video_preset not in {'ultrafast','superfast','veryfast','faster','fast','medium'}:
+    raise SystemExit('VIDEO_PRESET must be an x264 speed preset')
 
 def atomic(path, value):
     # Writers can overlap at movie/rewind boundaries. Never share a staging
@@ -610,12 +627,15 @@ def run():
         graph += ';[reactive_analog_out]null[v]'
     else:
         graph+='[v]'
+    # Monitor encoding throughput without changing segment timing.
+    # speed < 1x while broadcasting indicates the machine cannot keep up.
     cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','warning',
+         '-nostats','-stats_period','5','-progress',str(progress_path),
          '-fflags','+genpts+discardcorrupt','-f','mpegts','-i','pipe:0',*inputs,
          '-filter_complex',graph,'-map','[v]','-map','0:a:0',
          '-af','aresample=48000:async=1000:first_pts=0',
-         '-c:v','libx264','-preset','veryfast','-profile:v','main',
-         '-b:v','2000k','-maxrate','2600k','-bufsize','5200k',
+         '-c:v','libx264','-preset',video_preset,'-profile:v','main',
+         '-b:v',video_bitrate,'-maxrate',video_maxrate,'-bufsize',video_bufsize,
          '-g',str(fps*2),'-keyint_min',str(fps*2),'-sc_threshold','0',
          '-pix_fmt','yuv420p',
          '-c:a','aac','-b:a','96k','-ar','48000','-ac','2',
@@ -630,6 +650,8 @@ def run():
     print(f'[Prime Lite] http://{bind}:{port}/{slug}/index.m3u8',flush=True)
     print(f'[Prime Lite] Font: {font or "FFmpeg default"}',flush=True)
     print(f'[Prime Lite] Continuous HLS encoder: PID {encoder.pid}',flush=True)
+    print(f'[Prime Lite] Video: {w}x{h} @ {fps}fps, {video_bitrate}, max {video_maxrate}, preset {video_preset}',flush=True)
+    print(f'[Prime Lite] Encoder speed log: {progress_path}',flush=True)
     print(f'[Prime Lite] Log: {log_path}',flush=True)
     try:
         while not stop.is_set():

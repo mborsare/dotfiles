@@ -1,203 +1,68 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ─────────────────────────────────────────────────────────────
-# Defaults & state
-# ─────────────────────────────────────────────────────────────
-
-DEST_NAME="${XEROX_DEST:-cloud}"
+DEST="${XEROX_DEST:-cloud}"
 MOVE=0
 DRY_RUN=0
 
-# ─────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────
-
 usage() {
-  cat >&2 <<'USAGE'
-usage: xerox [OPTIONS] PATH
-
-options:
-  -h, --help              show this help
-  -m, --move              delete source after successful transfer
-  -n, --dry-run           show what would happen
-  -t, --to DEST           destination (default: cloud)
-  -l, --list              list available destinations
-
-examples:
-  xerox ~/videos/vacation.mp4
-  xerox --dry-run ~/data
-  xerox --move /large/dataset
-  xerox --to primebook ~/Pictures/screenshot.png
-  xerox --to morningbrief ~/Pictures/morningbrief/2026-06-04
-
-destinations:
-  cloud         copies to mikeb@oldbook.prime:~/cloud/ (symlink to mount)
-  oldbook       copies to mikeb@oldbook.prime:~/incoming/
-  primebook     copies to mikeb@primebook.prime:~/incoming/
-  morningbrief  copies to mikeb@primebook.prime:~/cloud/morningbrief/
-USAGE
+  cat >&2 <<'EOF'
+usage: xerox [-m] [-n] [-t DEST] PATH
+  -m, --move       delete source files after transfer
+  -n, --dry-run    show what would happen
+  -t, --to DEST    cloud | oldbook | primebook | morningbrief (default: cloud)
+  -l, --list       list destinations
+  -h, --help       show this help
+EOF
 }
 
-error() {
-  printf '%s: %s\n' "${0##*/}" "$*" >&2
+die() {
+  printf 'xerox: %s\n' "$*" >&2
   exit 1
 }
 
-log() {
-  printf '%s\n' "$*" >&2
-}
-
-# Resolve destination config
-resolve_destination() {
-  local dest=$1
-
-  case "$dest" in
-    cloud)
-      # One canonical cloud drop.
-      # ~/cloud on oldbook is a symlink to the mount.
-      DEST_HOST="oldbook"
-      DEST_USER="mikeb"
-      DEST_DIR="cloud"
-      ;;
-
-    oldbook)
-      # The oldbook machine itself.
-      DEST_HOST="oldbook"
-      DEST_USER="mikeb"
-      DEST_DIR="incoming"
-      ;;
-
-    primebook)
-      # The primebook machine itself.
-      DEST_HOST="primebook"
-      DEST_USER="mikeb"
-      DEST_DIR="incoming"
-      ;;
-
-    morningbrief)
-      # Morning assets are made on oldbook and pushed to primebook.
-      DEST_HOST="primebook"
-      DEST_USER="mikeb"
-      DEST_DIR="cloud/morningbrief"
-      ;;
-
-    *)
-      error "unknown destination: $dest"
-      ;;
-  esac
-}
-
-# Rsync with common args
-do_rsync() {
-  local src=$1
-  local remote_path=$2
-  local is_dir=$3
-
-  local args=(-avh --partial --partial-dir=.rsync-partial --info=progress2)
-
-  [[ $DRY_RUN -eq 1 ]] && args+=(-n --itemize-changes)
-  [[ $MOVE -eq 1 ]] && args+=(--remove-source-files)
-
-  # Add trailing slash for directories (sync contents, not the dir itself)
-  if [[ "$is_dir" == "true" ]]; then
-    src="${src%/}/"
-    remote_path="${remote_path%/}/"
-  fi
-
-  rsync "${args[@]}" "$src" "$remote_path"
-}
-
-# ─────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────
-
-# Parse arguments
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help)
-      usage
-      exit 0
-      ;;
-
-    -l|--list)
-      printf '%s\n' "cloud" "oldbook" "primebook" "morningbrief"
-      exit 0
-      ;;
-
-    -m|--move)
-      MOVE=1
-      shift
-      ;;
-
-    -n|--dry-run)
-      DRY_RUN=1
-      shift
-      ;;
-
-    -t|--to)
-      [[ $# -ge 2 ]] || error "--to requires a destination"
-      DEST_NAME="$2"
-      shift 2
-      ;;
-
-    --to=*)
-      DEST_NAME="${1#--to=}"
-      shift
-      ;;
-
-    -*)
-      error "unknown option: $1"
-      ;;
-
-    *)
-      break
-      ;;
+    -h|--help) usage; exit 0 ;;
+    -l|--list) printf '%s\n' cloud oldbook primebook morningbrief; exit 0 ;;
+    -m|--move) MOVE=1; shift ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    -t|--to) [[ $# -ge 2 ]] || die "--to needs a destination"; DEST="$2"; shift 2 ;;
+    --to=*) DEST="${1#--to=}"; shift ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
   esac
 done
 
-# Handle positional args: PATH
-if [[ $# -ne 1 ]]; then
-  usage
-  exit 2
+[[ $# -eq 1 ]] || { usage; exit 2; }
+
+SRC="${1%/}"
+[[ -e "$SRC" ]] || die "not found: $SRC"
+
+case "$DEST" in
+  cloud)        HOST="oldbook";   DIR="cloud" ;;
+  oldbook)      HOST="oldbook";   DIR="incoming" ;;
+  primebook)    HOST="primebook"; DIR="incoming" ;;
+  morningbrief) HOST="primebook"; DIR="cloud/morningbrief" ;;
+  *)            die "unknown destination: $DEST" ;;
+esac
+
+REMOTE="mikeb@$HOST:~/$DIR"
+ARGS=(-avh --progress --partial)
+[[ $DRY_RUN -eq 1 ]] && ARGS+=(-n --itemize-changes)
+[[ $MOVE -eq 1 ]] && ARGS+=(--remove-source-files)
+
+if [[ $DRY_RUN -eq 0 ]]; then
+  ssh "mikeb@$HOST" "mkdir -p ~/$DIR" || die "mkdir failed"
 fi
 
-SRC="$1"
-
-# Validate source
-SRC="${SRC%/}"
-if [[ ! -e "$SRC" ]]; then
-  error "no such file or directory: $SRC"
-fi
-
-# Resolve destination
-resolve_destination "$DEST_NAME"
-
-# Resolve real paths
-name=$(basename "$SRC")
-parent_dir=$(cd "$(dirname "$SRC")" && pwd -P)
-is_dir="false"
-[[ -d "$SRC" ]] && is_dir="true"
-
-# Create remote directory
-ssh "$DEST_USER@$DEST_HOST" "mkdir -p ~/$DEST_DIR" || \
-  error "failed to create remote directory"
-
-# Display what we're doing
-log "Xeroxing $parent_dir/$name -> $DEST_USER@$DEST_HOST:~/$DEST_DIR/$name"
-
-# Do the copy
-remote="$DEST_USER@$DEST_HOST:~/$DEST_DIR"
-
-if [[ "$is_dir" == "true" ]]; then
-  do_rsync "$parent_dir/$name" "$remote/$name" true || \
-    error "rsync failed"
-
-  # Clean up empty dirs after move
+if [[ -d "$SRC" ]]; then
+  printf 'Xeroxing %s/ -> %s/%s/\n' "$SRC" "$REMOTE" "${SRC##*/}" >&2
+  rsync "${ARGS[@]}" "$SRC/" "$REMOTE/${SRC##*/}/" || die "rsync failed"
   if [[ $MOVE -eq 1 && $DRY_RUN -eq 0 ]]; then
-    find "$parent_dir/$name" -depth -type d -empty -delete
+    find "$SRC" -mindepth 1 -depth -type d -empty -delete
   fi
 else
-  do_rsync "$parent_dir/$name" "$remote" false || \
-    error "rsync failed"
+  printf 'Xeroxing %s -> %s/\n' "$SRC" "$REMOTE" >&2
+  rsync "${ARGS[@]}" "$SRC" "$REMOTE/" || die "rsync failed"
 fi
