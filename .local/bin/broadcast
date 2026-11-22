@@ -17,6 +17,11 @@ VIDEO_PRESET="${VIDEO_PRESET:-superfast}"
 VIDEO_BITRATE="${VIDEO_BITRATE:-2000k}"
 VIDEO_MAXRATE="${VIDEO_MAXRATE:-2600k}"
 VIDEO_BUFSIZE="${VIDEO_BUFSIZE:-5200k}"
+# Lightweight normalization transport (final output remains H.264 at full resolution).
+# Higher MPEG-2 qscale = smaller bridge stream; 6 is a moderate compromise vs old 4.
+TRANSPORT_QSCALE="${TRANSPORT_QSCALE:-6}"
+# Bound per-source MPEG-2 encoder threads for four simultaneous broadcasters.
+TRANSPORT_THREADS="${TRANSPORT_THREADS:-2}"
 QUOTE_BASE_URL="${QUOTE_BASE_URL:-https://weather.mborsare.workers.dev/prime/weather}"
 REWIND_SECONDS="${REWIND_SECONDS:-10}"
 FFMPEG="${FFMPEG:-ffmpeg}"
@@ -82,6 +87,7 @@ fi
 [[ -f "$COMIC_SHANNS_FONT" ]] || COMIC_SHANNS_FONT=''
 export STREAM_SLUG PORT BIND_ADDR ROOT_HLS_DIR MEDIA_PATH LOGO_PATH DEFAULT_SIZE OUTPUT_FPS
 export VIDEO_PRESET VIDEO_BITRATE VIDEO_MAXRATE VIDEO_BUFSIZE
+export TRANSPORT_QSCALE TRANSPORT_THREADS
 export QUOTE_BASE_URL REWIND_SECONDS FFMPEG FFPROBE COMIC_SHANNS_FONT
 export SHOW_RUNTIME NOW_PLAYING_TITLE ANALOG TAPE_WEAR
 
@@ -116,6 +122,8 @@ video_preset = os.environ['VIDEO_PRESET']
 video_bitrate = os.environ['VIDEO_BITRATE']
 video_maxrate = os.environ['VIDEO_MAXRATE']
 video_bufsize = os.environ['VIDEO_BUFSIZE']
+transport_qscale = int(os.environ['TRANSPORT_QSCALE'])
+transport_threads = int(os.environ['TRANSPORT_THREADS'])
 rewind_secs = max(0.1, float(os.environ['REWIND_SECONDS']))
 ffmpeg = os.environ['FFMPEG']
 ffprobe = os.environ['FFPROBE']
@@ -144,6 +152,10 @@ if w % 2 or h % 2 or w < 2 or h < 2 or fps < 1:
     raise SystemExit('DEFAULT_SIZE must have even positive dimensions; FPS >=1')
 if video_preset not in {'ultrafast','superfast','veryfast','faster','fast','medium'}:
     raise SystemExit('VIDEO_PRESET must be an x264 speed preset')
+if not (2 <= transport_qscale <= 12):
+    raise SystemExit('TRANSPORT_QSCALE must be between 2 and 12')
+if not (1 <= transport_threads <= 8):
+    raise SystemExit('TRANSPORT_THREADS must be between 1 and 8')
 
 def atomic(path, value):
     # Writers can overlap at movie/rewind boundaries. Never share a staging
@@ -411,7 +423,11 @@ def quote_worker():
 
 # Pre-normalize each program to identical MPEG-TS transport parameters.
 # One HLS encoder reads the concatenated bytes without closing stdin.
-transport_video = ['-c:v','mpeg2video','-q:v','4','-g',str(2*fps),
+# Keep the two-stage file-normalization bridge, but reduce intermediate bits
+# and per-channel CPU contention. Dimensions, FPS, and codecs remain unchanged.
+# Retain 2s MPEG-2 recovery keyframes, independent of 5s final HLS segments.
+transport_video = ['-c:v','mpeg2video','-q:v',str(transport_qscale),
+                   '-g',str(2*fps),'-threads:v',str(transport_threads),
                    '-pix_fmt','yuv420p']
 transport_audio = ['-c:a','mp2','-b:a','128k','-ar','48000','-ac','2']
 transport_output = ['-f','mpegts','-mpegts_flags','+resend_headers','pipe:1']
@@ -636,14 +652,15 @@ def run():
          '-af','aresample=48000:async=1000:first_pts=0',
          '-c:v','libx264','-preset',video_preset,'-profile:v','main',
          '-b:v',video_bitrate,'-maxrate',video_maxrate,'-bufsize',video_bufsize,
-         '-g',str(fps*2),'-keyint_min',str(fps*2),'-sc_threshold','0',
+         '-g',str(fps*5),'-keyint_min',str(fps*5),'-sc_threshold','0',
          '-pix_fmt','yuv420p',
          '-c:a','aac','-b:a','96k','-ar','48000','-ac','2',
-         # Keep two minutes in the playlist, plus 30 retired segments for late clients.
-         '-f','hls','-hls_time','2','-hls_list_size','60',
+         # Five-second HLS segments; retain about two minutes live, plus
+         # twelve retired segments (~60 seconds) for delayed clients.
+         '-f','hls','-hls_time','5','-hls_list_size','24',
          '-hls_start_number_source','epoch',
          '-hls_flags','delete_segments+omit_endlist+independent_segments+program_date_time',
-         '-hls_delete_threshold','30','-hls_segment_filename',str(out/'seg_%d.ts'),
+         '-hls_delete_threshold','12','-hls_segment_filename',str(out/'seg_%d.ts'),
          str(out/'index.m3u8')]
     encoder=subprocess.Popen(cmd,stdin=subprocess.PIPE,stderr=log_file,bufsize=0)
     processes.append(encoder)
@@ -651,6 +668,7 @@ def run():
     print(f'[Prime Lite] Font: {font or "FFmpeg default"}',flush=True)
     print(f'[Prime Lite] Continuous HLS encoder: PID {encoder.pid}',flush=True)
     print(f'[Prime Lite] Video: {w}x{h} @ {fps}fps, {video_bitrate}, max {video_maxrate}, preset {video_preset}',flush=True)
+    print(f'[Prime Lite] Bridge: MPEG-2 qscale {transport_qscale}, {transport_threads} threads',flush=True)
     print(f'[Prime Lite] Encoder speed log: {progress_path}',flush=True)
     print(f'[Prime Lite] Log: {log_path}',flush=True)
     try:
