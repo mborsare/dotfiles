@@ -636,15 +636,14 @@ def run():
          '-af','aresample=48000:async=1000:first_pts=0',
          '-c:v','libx264','-preset',video_preset,'-profile:v','main',
          '-b:v',video_bitrate,'-maxrate',video_maxrate,'-bufsize',video_bufsize,
-         '-g',str(fps*8),'-keyint_min',str(fps*8),'-sc_threshold','0',
+         '-g',str(fps*2),'-keyint_min',str(fps*2),'-sc_threshold','0',
          '-pix_fmt','yuv420p',
          '-c:a','aac','-b:a','96k','-ar','48000','-ac','2',
-         # Eight-second HLS segments; retain about two minutes live, plus
-         # eight retired segments (~64 seconds) for delayed clients.
-         '-f','hls','-hls_time','8','-hls_list_size','15',
+         # Keep two minutes in the playlist, plus 30 retired segments for late clients.
+         '-f','hls','-hls_time','2','-hls_list_size','60',
          '-hls_start_number_source','epoch',
          '-hls_flags','delete_segments+omit_endlist+independent_segments+program_date_time',
-         '-hls_delete_threshold','8','-hls_segment_filename',str(out/'seg_%d.ts'),
+         '-hls_delete_threshold','30','-hls_segment_filename',str(out/'seg_%d.ts'),
          str(out/'index.m3u8')]
     encoder=subprocess.Popen(cmd,stdin=subprocess.PIPE,stderr=log_file,bufsize=0)
     processes.append(encoder)
