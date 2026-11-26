@@ -32,16 +32,16 @@ media_set=0
 while (( $# )); do
   case "$1" in
     --slug)
-      (( $# &gt;= 2 )) || { echo '--slug needs a name' &gt;&amp;2; exit 2; }
+      (( $# >= 2 )) || { echo '--slug needs a name' >&2; exit 2; }
       STREAM_SLUG="$2"; shift 2 ;;
     --port)
-      (( $# &gt;= 2 )) || { echo '--port needs a number' &gt;&amp;2; exit 2; }
+      (( $# >= 2 )) || { echo '--port needs a number' >&2; exit 2; }
       PORT="$2"; shift 2 ;;
     --runtime) SHOW_RUNTIME=1; shift ;;
     --analog) ANALOG=1; shift ;;
     --tape-wear) TAPE_WEAR=1; shift ;;
     --now-playing)
-      (( $# &gt;= 2 )) || { echo '--now-playing needs a title' &gt;&amp;2; exit 2; }
+      (( $# >= 2 )) || { echo '--now-playing needs a title' >&2; exit 2; }
       NOW_PLAYING_TITLE="$2"; shift 2 ;;
     --help|-h)
       echo 'usage: broadcast [MOVIE_OR_DIRECTORY] [--slug NAME] [--port PORT] [--runtime] [--analog] [--tape-wear] [--now-playing TITLE]'
@@ -57,24 +57,24 @@ while (( $# )); do
       echo '               Display only; files and audio are unchanged. Resets on restart.'
       echo '  Both effects follow soundtrack hits with a short visual release.'
       exit 0 ;;
-    --) shift; (( $# == 1 &amp;&amp; ! media_set )) || exit 2; MEDIA_PATH="$1"; media_set=1; shift ;;
-    -*) echo "Unknown argument: $1" &gt;&amp;2; exit 2 ;;
-    *) (( ! media_set )) || { echo 'Only one media path is allowed' &gt;&amp;2; exit 2; }
+    --) shift; (( $# == 1 && ! media_set )) || exit 2; MEDIA_PATH="$1"; media_set=1; shift ;;
+    -*) echo "Unknown argument: $1" >&2; exit 2 ;;
+    *) (( ! media_set )) || { echo 'Only one media path is allowed' >&2; exit 2; }
        MEDIA_PATH="$1"; media_set=1; shift ;;
   esac
 done
-[[ "$STREAM_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo 'Invalid stream slug' &gt;&amp;2; exit 2; }
+[[ "$STREAM_SLUG" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { echo 'Invalid stream slug' >&2; exit 2; }
 if [[ -n "$PORT" ]]; then
-  [[ "$PORT" =~ ^[0-9]+$ ]] &amp;&amp; (( 10#$PORT &gt;= 1 &amp;&amp; 10#$PORT &lt;= 65535 )) || { echo 'Invalid port' &gt;&amp;2; exit 2; }
+  [[ "$PORT" =~ ^[0-9]+$ ]] && (( 10#$PORT >= 1 && 10#$PORT <= 65535 )) || { echo 'Invalid port' >&2; exit 2; }
 fi
-[[ -e "$MEDIA_PATH" ]] || { echo "Missing media: $MEDIA_PATH" &gt;&amp;2; exit 1; }
+[[ -e "$MEDIA_PATH" ]] || { echo "Missing media: $MEDIA_PATH" >&2; exit 1; }
 for binary in "$FFMPEG" "$FFPROBE" python3; do
-  command -v "$binary" &gt;/dev/null || { echo "Missing $binary" &gt;&amp;2; exit 1; }
+  command -v "$binary" >/dev/null || { echo "Missing $binary" >&2; exit 1; }
 done
 
 # Comic Shanns: working original broadcaster's exact lookup
-if [[ -z "$COMIC_SHANNS_FONT" ]] &amp;&amp; command -v fc-match &gt;/dev/null 2&gt;&amp;1; then
-  COMIC_SHANNS_FONT="$(fc-match -f '%{file}\n' 'ComicShannsMono Nerd Font' 2&gt;/dev/null | head -n 1 || true)"
+if [[ -z "$COMIC_SHANNS_FONT" ]] && command -v fc-match >/dev/null 2>&1; then
+  COMIC_SHANNS_FONT="$(fc-match -f '%{file}\n' 'ComicShannsMono Nerd Font' 2>/dev/null | head -n 1 || true)"
 fi
 if [[ ! -f "$COMIC_SHANNS_FONT" ]]; then
   COMIC_SHANNS_FONT='/usr/share/fonts/OTF/ComicShannsMonoNerdFont-Regular.otf'
@@ -86,7 +86,7 @@ export QUOTE_BASE_URL REWIND_SECONDS FFMPEG FFPROBE COMIC_SHANNS_FONT
 export SHOW_RUNTIME NOW_PLAYING_TITLE ANALOG TAPE_WEAR
 
 # Continuous Controller
-exec python3 - &lt;&lt;'PY'
+exec python3 - <<'PY'
 import fcntl
 import http.server
 import json
@@ -140,8 +140,8 @@ transport_position = 0.0
 broadcast_started = time.monotonic()
 completed_plays = {}
 
-if w % 2 or h % 2 or w &lt; 2 or h &lt; 2 or fps &lt; 1:
-    raise SystemExit('DEFAULT_SIZE must have even positive dimensions; FPS &gt;=1')
+if w % 2 or h % 2 or w < 2 or h < 2 or fps < 1:
+    raise SystemExit('DEFAULT_SIZE must have even positive dimensions; FPS >=1')
 if video_preset not in {'ultrafast','superfast','veryfast','faster','fast','medium'}:
     raise SystemExit('VIDEO_PRESET must be an x264 speed preset')
 
@@ -172,13 +172,13 @@ def resolve_port(root, slug, requested=None):
         assigned = json.loads(registry.read_text()) if registry.exists() else {}
         if (not isinstance(assigned, dict)
                 or any(name in fixed or not isinstance(value, int)
-                       or not 8092 &lt;= value &lt;= 65535
+                       or not 8092 <= value <= 65535
                        for name, value in assigned.items())
                 or len(set(assigned.values())) != len(assigned)):
             raise ValueError(f'Invalid channel port registry: {registry}')
         if slug not in assigned:
             next_port = max([8091, *assigned.values()]) + 1
-            if next_port &gt; 65535:
+            if next_port > 65535:
                 raise RuntimeError('No channel ports remaining')
             assigned[slug] = next_port
             atomic(registry, json.dumps(assigned, sort_keys=True))
@@ -372,8 +372,8 @@ def uptime_worker():
 def fetch_nq_price():
     urls = [
         quote_url,
-        'https://query1.finance.yahoo.com/v8/finance/chart/NQ%3DF?range=1d&amp;interval=1m',
-        'https://query2.finance.yahoo.com/v8/finance/chart/NQ%3DF?range=1d&amp;interval=1m',
+        'https://query1.finance.yahoo.com/v8/finance/chart/NQ%3DF?range=1d&interval=1m',
+        'https://query2.finance.yahoo.com/v8/finance/chart/NQ%3DF?range=1d&interval=1m',
     ]
     errors = []
     for url in urls:
@@ -405,7 +405,7 @@ def quote_worker():
     next_refresh=0
     while not stop.is_set():
         now=time.monotonic()
-        if now &gt;= next_refresh:
+        if now >= next_refresh:
             next_refresh=now+15
             try:
                 price=str(math.trunc(fetch_nq_price()))
@@ -466,8 +466,8 @@ def transport_rewind(duration, movie_duration):
            digits(f'mod(floor(({remaining})/60000),60)',2)+':'+
            digits(f'mod(floor(({remaining})/1000),60)',2)+'.'+
            digits(f'mod({remaining},1000)',3))
-    atomic(rewind_frame_label,'&lt;&lt; Rewind')
-    atomic(play_frame_label,'Play &gt;')
+    atomic(rewind_frame_label,'<< Rewind')
+    atomic(play_frame_label,'Play >')
     switch=rewind_secs+.35
     vf=','.join((
         draw(rewind_frame_label,32,'(w-tw)/2','h/2-45',False)+f":enable='lt(t,{switch})'",
@@ -501,7 +501,7 @@ def pump(cmd, encoder):
         while not stop.is_set():
             if encoder.poll() is not None:
                 raise RuntimeError(f'HLS encoder exited: {encoder.returncode}')
-            if time.monotonic()-last_progress &gt; 60:
+            if time.monotonic()-last_progress > 60:
                 raise RuntimeError('Transport stalled for 60 seconds')
             readable,writable,_=select.select(
                 [] if pending else [source.stdout],
@@ -583,7 +583,7 @@ def rewind(path, duration, encoder):
     atomic(rewind_label,'')
     atomic(rewind_stamp,'')
     total=rewind_secs+1.35
-    print('[Prime Lite] &lt;&lt; Rewind -&gt; 00:00:00.000 -&gt; Play &gt;',flush=True)
+    print('[Prime Lite] << Rewind -> 00:00:00.000 -> Play >',flush=True)
     pump(transport_rewind(total,duration),encoder)
 
 def run():
@@ -634,7 +634,7 @@ def run():
     else:
         graph+='[v]'
     # Monitor encoding throughput without changing segment timing.
-    # speed &lt; 1x while broadcasting indicates the machine cannot keep up.
+    # speed < 1x while broadcasting indicates the machine cannot keep up.
     cmd=[ffmpeg,'-nostdin','-hide_banner','-loglevel','warning',
          '-nostats','-stats_period','5','-progress',str(progress_path),
          '-fflags','+genpts+discardcorrupt','-f','mpegts','-i','pipe:0',*inputs,
@@ -699,7 +699,7 @@ log_file=log_path.open('a')
 def maintain_log():
     while not stop.wait(30):
         try:
-            if os.fstat(log_file.fileno()).st_size &gt; 8*1024*1024:
+            if os.fstat(log_file.fileno()).st_size > 8*1024*1024:
                 with log_path.open('rb') as reader:
                     reader.seek(-1024*1024,os.SEEK_END)
                     tail=reader.read()
