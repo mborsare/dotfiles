@@ -283,7 +283,7 @@ alias bins='cd "$HOME/.local/bin"'
 alias d='dot'
 alias day="$HOME/day.sh"
 alias delete='rm -rv'
-alias deploytv='(cd ~/Projects/oldbook.work && git pull --ff-only && rsync -av --exclude=".git" ./ /srv/htmlsrv/oldbook.work/)'
+alias deploytv='(cd ~/Projects/oldbook.work && git pull --ff-only && rsync -av --no-owner --no-group --exclude=".git" ./ /srv/htmlsrv/oldbook.work/)'
 alias docs='cd "$HOME/Documents"'
 alias dot='git --git-dir="$HOME/.local/share/dotfiles.git" --work-tree="$HOME"'
 alias da='dot add'
